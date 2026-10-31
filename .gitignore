@@ -1,0 +1,12 @@
+# Compiled output. Rebuilt by `make build`; never committed.
+build/
+*.class
+
+# Fetched by `make deps` (LWJGL 3.4.3 jars + natives, ~11 MB). Compile-only; never committed.
+third_party/
+
+# Editor and OS noise.
+.idea/
+*.iml
+.vscode/
+.DS_Store
