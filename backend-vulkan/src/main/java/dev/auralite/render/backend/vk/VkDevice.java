@@ -75,6 +75,8 @@ import org.lwjgl.vulkan.VkMemoryRequirements;
 import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
+import org.lwjgl.vulkan.VkPhysicalDeviceHostQueryResetFeaturesEXT;
+import org.lwjgl.vulkan.VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
@@ -120,13 +122,17 @@ import static org.lwjgl.vulkan.EXTDebugUtils.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSE
 import static org.lwjgl.vulkan.EXTMeshShader.VK_EXT_MESH_SHADER_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
+import static org.lwjgl.vulkan.EXTVertexAttributeRobustness.VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME;
+import static org.lwjgl.vulkan.EXTVertexAttributeRobustness.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT;
+import static org.lwjgl.vulkan.EXTHostQueryReset.VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME;
+import static org.lwjgl.vulkan.EXTHostQueryReset.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT;
+import static org.lwjgl.vulkan.KHRDeferredHostOperations.VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR;
 import static org.lwjgl.vulkan.KHRRayQuery.VK_KHR_RAY_QUERY_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRRayQuery.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME;
 import static org.lwjgl.vulkan.KHRRayTracingPipeline.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR;
-import static org.lwjgl.vulkan.KHRSwapchain.VK_KHR_SWAPCHAIN_EXTENSION_NAME;
 import static org.lwjgl.vulkan.VK13.*;
 
 /**
@@ -190,6 +196,7 @@ public final class VkDevice implements GfxDevice {
     private final Map<Integer, Long> familyPools = new HashMap<Integer, Long>();
     private final long timestampPool;
     private int timestampIndex;
+    private boolean hostQueryResetSupported;
 
     private long frameId;
     private long totalCreated;
@@ -212,7 +219,8 @@ public final class VkDevice implements GfxDevice {
             boolean wantMesh = availableExt.contains(VK_EXT_MESH_SHADER_EXTENSION_NAME);
             boolean wantRay = availableExt.contains(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME)
                     && availableExt.contains(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME)
-                    && availableExt.contains(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+                    && availableExt.contains(VK_KHR_RAY_QUERY_EXTENSION_NAME)
+                    && availableExt.contains(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
             this.meshSupported = wantMesh;
             this.rayQuerySupported = wantRay;
             this.rayPipelineSupported = wantRay;
@@ -361,13 +369,22 @@ public final class VkDevice implements GfxDevice {
                     .queueFamilyIndex(family).pQueuePriorities(prio);
             qi++;
         }
+        boolean hostReset = availableExt.contains(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+        this.hostQueryResetSupported = hostReset;
+        // Fullscreen-triangle packs declare vertex inputs they do not fill yet
+        // (the world mesh is future work); GL returns the standard unbound
+        // constant there, so Vulkan asks for the matching robustness feature
+        // instead of leaving the read undefined (VUID Input-07904 named it).
+        boolean vertexRobust = availableExt.contains(VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME);
         List<String> want = new ArrayList<String>();
-        if (availableExt.contains(VK_KHR_SWAPCHAIN_EXTENSION_NAME)) want.add(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+        if (hostReset) want.add(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
+        if (vertexRobust) want.add(VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME);
         if (mesh) want.add(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         if (ray) {
             want.add(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
             want.add(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME);
             want.add(VK_KHR_RAY_QUERY_EXTENSION_NAME);
+            want.add(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
         }
         PointerBuffer extNames = stack.mallocPointer(want.size());
         for (int i = 0; i < want.size(); i++) extNames.put(i, stack.UTF8(want.get(i)));
@@ -415,6 +432,20 @@ public final class VkDevice implements GfxDevice {
                     .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR)
                     .accelerationStructure(true);
             asFeatures.pNext(head); head = asFeatures.address();
+        }
+        if (hostReset) {
+            VkPhysicalDeviceHostQueryResetFeaturesEXT hostResetFeatures =
+                    VkPhysicalDeviceHostQueryResetFeaturesEXT.calloc(stack)
+                            .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT)
+                            .hostQueryReset(true);
+            hostResetFeatures.pNext(head); head = hostResetFeatures.address();
+        }
+        if (vertexRobust) {
+            VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT vertexRobustFeatures =
+                    VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT.calloc(stack)
+                            .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT)
+                            .vertexAttributeRobustness(true);
+            vertexRobustFeatures.pNext(head); head = vertexRobustFeatures.address();
         }
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
@@ -878,8 +909,15 @@ public final class VkDevice implements GfxDevice {
             }
         }
         inFlightFences.clear();
-        vkResetQueryPool(device, timestampPool, 0, 256);
-        timestampIndex = 0;
+        if (hostQueryResetSupported) {
+            vkResetQueryPool(device, timestampPool, 0, 256);
+            timestampIndex = 0;
+        } else {
+            // No VK_EXT_host_query_reset on this device: core forbids the host
+            // reset without the feature (VUID-vkResetQueryPool-None-02665), so
+            // the pool keeps last frame's values until a device that offers it.
+            timestampIndex = 0;
+        }
         return ++frameId;
     }
 

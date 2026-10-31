@@ -16,7 +16,7 @@ backend-gl/      OpenGL 4.6 device (Java 11, LWJGL, compile-verified)
 backend-vulkan/  Vulkan 1.3 device (Java 11, LWJGL, compile-verified)
 fabric/          mod glue: Java 21 + Gradle/Loom (sources + json; build SKIPs here)
 packs/           AuraLite-Native reference pack
-tests/           7 suites, one `RunAll`, no GPU required
+tests/           8 suites, one `RunAll`, no GPU required
 tools/           packlint, drift-check
 docs/            STATUS, ROADMAP, api/, plans/
 third_party/     gitignored LWJGL 3.4.3, fetched by `make deps` (compile-only)
@@ -26,16 +26,26 @@ third_party/     gitignored LWJGL 3.4.3, fetched by `make deps` (compile-only)
 
 ```
 make deps    # fetch LWJGL 3.4.3 into third_party/ (~11 MB)
-make test    # build everything, run 7 suites
+make test    # build everything, run all 8 suites
 make bench   # run the perf gates 5x
+make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]
+make gpu-test   # run OUR GL/Vulkan backends on this host's GPU (software ok);
+                # one named receipt per lane: RENDERED / REFUSED-NAMED / SKIP-NAMED
+             # validate a pack: exit 1 on error, warnings on stderr,
+             # --strict promotes warnings, --null-device checks capabilities
+make drift-check
+             # replay the suite receipts; numbers that moved without their
+             # doc lines are reported by name and fail the gate
 ```
 
 Host rule: everything except `fabric/` stays Java 11 source-compatible, so
 `make test` is genuinely green on OpenJDK 11. `fabric/` is the documented
 exception — it needs a JDK 21 lane this sandbox does not have.
 
-Current state: **967 passed, 0 failed, 2 negative controls, 7/7 suites green**,
-both backends compile `rc=0` against real LWJGL sources.
+Current state: **1008 passed, 0 failed, 2 negative controls, 8/8 suites green**,
+both backends compile `rc=0` against real LWJGL sources, and the reference
+pack `packs/AuraLite-Native` lints clean and runs a NULL frame with 0
+violations.
 
 ## The two modes
 
@@ -58,6 +68,12 @@ report instead of happening silently. Format authority:
   and where it plugs into AuraLite-OS and the Emulator
 - [docs/api/RHI.md](docs/api/RHI.md) — the device contract both backends keep
 - [docs/api/PACK_FORMAT.md](docs/api/PACK_FORMAT.md) — the pack grammar
+- [docs/api/GRAPH.md](docs/api/GRAPH.md) — the render graph: order, barriers,
+  lifetimes, aliasing
+- [docs/api/UNIFORMS.md](docs/api/UNIFORMS.md) — the pack expression language
+  and the spatial opt-in
+- [docs/api/BIOME.md](docs/api/BIOME.md) — the biome field, the sampler, the
+  LUT and the legacy bake
 
 ## Standing rules
 
@@ -66,6 +82,7 @@ report instead of happening silently. Format authority:
    which call, and what was wrong.
 3. The NULL backend is the spec. If GL and VK disagree, the recording device
    settles it.
-4. No GPU in the sandbox, so backends are compile-verified here and
-   behaviour-verified where a GPU exists. Never claim a frame was rendered
-   until one has been.
+4. The sandbox's software GPUs (lavapipe, llvmpipe, zink) do render - but a
+   frame is claimed only by the harness's own `RENDERED` receipt
+   (submit + waitIdle of the real command buffer), with pixel hashes and
+   validation-clean kept as their own separate gates in docs/STATUS.md.

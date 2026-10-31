@@ -146,24 +146,34 @@ public final class PackSuite {
     }
 
     /** A provider that answers every program with a valid NULL pipeline. */
-    static PipelineProvider stubProvider(final NullDevice d) {
+    static PipelineProvider stubProvider(final NullDevice d, final PackManifest m) {
         return new PipelineProvider() {
             @Override public GfxPipeline rasterPipeline(String name, GfxDesc.RenderPass pass) {
                 return d.createGraphicsPipeline(new GfxDesc.GraphicsPipeline()
+                        .renderPass(pass)
                         .stage(d.createShaderModule(dev.auralite.render.rhi.ShaderSource.glsl(
                                 GfxStage.VERTEX, VERT, name + ".vert")))
                         .stage(d.createShaderModule(dev.auralite.render.rhi.ShaderSource.glsl(
                                 GfxStage.FRAGMENT, FRAG, name + ".frag")))
+                        .layout(programLayout(m, name))
                         .named(name));
             }
             @Override public GfxPipeline computePipeline(String name) {
                 return d.createComputePipeline(dev.auralite.render.rhi.GfxDesc.ComputePipeline
                         .of(d.createShaderModule(dev.auralite.render.rhi.ShaderSource.glsl(
                                 GfxStage.COMPUTE, COMP, name + ".comp")))
-                        .localSize(16, 16, 1).named(name));
+                        .localSize(16, 16, 1)
+                        .layout(programLayout(m, name))
+                        .named(name));
             }
             @Override public boolean has(String name) { return true; }
         };
+    }
+
+    /** The image-uniform layout the pack's shaders describe, or null for none. */
+    static GfxDesc.PipelineLayout programLayout(PackManifest m, String name) {
+        PackProgram p = m.program(name);
+        return p == null ? null : p.layout();
     }
 
     public static void run() {
@@ -287,7 +297,7 @@ public final class PackSuite {
 
         section("native: builds a real graph and executes it");
         NullDevice ndev = new NullDevice();
-        PackGraphBuilder builder = new PackGraphBuilder(n, stubProvider(ndev));
+        PackGraphBuilder builder = new PackGraphBuilder(n, stubProvider(ndev, n));
         RenderGraph g = builder.build(1920, 1080, n.shadowMapResolution(), new int[] { 23, 97, 23 });
         CompiledGraph c = g.compile(1920, 1080, ndev.limits());
         List<String> order = c.passOrder();
@@ -328,7 +338,7 @@ public final class PackSuite {
 
         section("an option turning a pass off is honoured");
         n.setOption("SSAO", "false");
-        RenderGraph g2 = new PackGraphBuilder(n, stubProvider(ndev)).build(1920, 1080, 4096, new int[] { 23, 97, 23 });
+        RenderGraph g2 = new PackGraphBuilder(n, stubProvider(ndev, n)).build(1920, 1080, 4096, new int[] { 23, 97, 23 });
         CompiledGraph c2 = g2.compile(1920, 1080, ndev.limits());
         check(!c2.passOrder().contains("ssao"), "turning SSAO off removes the pass from the frame");
         eq(c2.stats().disabled.size(), 1, "and the receipt says why");
@@ -380,7 +390,7 @@ public final class PackSuite {
 
         section("legacy: synthesises a graph too");
         NullDevice ldev = new NullDevice();
-        RenderGraph lg = new PackGraphBuilder(lm, stubProvider(ldev)).build(1920, 1080, 4096, null);
+        RenderGraph lg = new PackGraphBuilder(lm, stubProvider(ldev, lm)).build(1920, 1080, 4096, null);
         CompiledGraph lc = lg.compile(1920, 1080, ldev.limits());
         List<String> lorder = lc.passOrder();
         receipt("legacy order: " + lorder);
@@ -479,7 +489,88 @@ public final class PackSuite {
         contains(bothLoader.report().notes().toString(), "legacy tree was ignored",
                 "and that the other was ignored");
 
+        section("reference pack: packs/AuraLite-Native is the executable spec");
+        java.nio.file.Path refDir = java.nio.file.Paths.get("packs/AuraLite-Native");
+        check(java.nio.file.Files.isRegularFile(refDir.resolve("pack.aurapack")),
+                "packs/AuraLite-Native/pack.aurapack exists (run make test from the repository root)");
+        PackLoader rl = new PackLoader(new PackSource.Directory(refDir));
+        check(rl.load(null), "the reference pack loads with 0 errors: " + rl.report().errors());
+        PackManifest rm = rl.manifest();
+        eq(rl.report().errorCount(), 0, "0 errors");
+        eq(rl.report().warningCount(), 0, "0 warnings - it lints clean: " + rl.report().warnings());
+        eq(rm.format, PackFormat.NATIVE, "detected NATIVE");
+        eq(rm.apiLevel, 1, "api level 1");
+        check(rm.requiredCapabilities.contains(GfxCapability.COMPUTE_SHADERS),
+                "the compute requirement survived validation");
+        check(rm.spatialBiomeUniforms, "spatial biome uniforms are on");
+        eq(rm.graph.passes().size(), 6, "6 passes cover raster, compute, history and external");
+        eq(rm.optionCount(), 4, "4 options cover bool, select, slider and const");
+        eq(rm.programCount(), 6, "6 programs, every stage listed explicitly");
+        eq(rm.graph.presentResource, "taa", "the present resource is declared");
+
+        // The provider answers only with the pack's own declared programs and
+        // sources, so the NULL device structurally validates the shipped GLSL
+        // (entry point per stage) as part of this gate.
+        NullDevice rdev = new NullDevice();
+        PackGraphBuilder rb = new PackGraphBuilder(rm, packBackedProvider(rdev, rm));
+        RenderGraph rg = rb.build(1920, 1080, rm.shadowMapResolution(), new int[] { 23, 97, 23 });
+        CompiledGraph rc = rg.compile(1920, 1080, rdev.limits());
+        List<String> rorder = rc.passOrder();
+        eq(rorder.get(rorder.size() - 1), "present", "present is last");
+        check(rorder.contains("biome_field"), "the compute pass survives culling (terrain reads its output)");
+        check(rorder.contains("ssao"), "the option-gated compute pass runs with SSAO on by default");
+        rc.allocate(rdev);
+        rc.bindImported("backbuffer", rdev.createImage(GfxDesc.Image.tex2d(1920, 1080,
+                GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT)
+                .named("window")));
+        rdev.beginFrame();
+        RecordingCommandBuffer rcb = (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
+        rcb.begin();
+        rc.execute(new GraphContext(rdev, rcb, rc, new FrameContext()));
+        rcb.end();
+        rdev.submit(QueueType.GRAPHICS, rcb);
+        rdev.endFrame();
+        eq(rdev.violations().size(), 0,
+                "the reference frame ran with 0 contract violations: " + rdev.violations());
+        eq(rcb.count(RecordingCommandBuffer.Op.BIND_COMPUTE), 2, "both compute pipelines were bound");
+        check(rcb.workGroupsDispatched() > 0, "the compute dispatches used the resolved extents");
+        receipt("reference pack: loads 0 errors 0 warnings, frame " + rcb.commandCount() + " commands, "
+                + rc.totalBarriers() + " barriers, " + rcb.workGroupsDispatched() + " work groups, 0 violations");
+        rc.release();
+        rdev.close();
+
         ndev.close();
         ldev.close();
+    }
+
+    /**
+     * A provider that answers only with the pack's own declared programs and
+     * shader sources - the reference-pack gate uses it so the shipped GLSL is
+     * what the NULL device validates, not a stub.
+     */
+    static PipelineProvider packBackedProvider(final NullDevice d, final PackManifest m) {
+        return new PipelineProvider() {
+            @Override public GfxPipeline rasterPipeline(String name, GfxDesc.RenderPass pass) {
+                PackProgram p = m.program(name);
+                GfxDesc.GraphicsPipeline gp = new GfxDesc.GraphicsPipeline()
+                        .renderPass(pass)
+                        .layout(programLayout(m, name)).named(name);
+                if (p.stage(GfxStage.VERTEX) != null) gp.stage(d.createShaderModule(p.stage(GfxStage.VERTEX)));
+                if (p.stage(GfxStage.FRAGMENT) != null) gp.stage(d.createShaderModule(p.stage(GfxStage.FRAGMENT)));
+                return d.createGraphicsPipeline(gp);
+            }
+            @Override public GfxPipeline computePipeline(String name) {
+                PackProgram p = m.program(name);
+                if (p == null || p.stage(GfxStage.COMPUTE) == null) return null;
+                return d.createComputePipeline(GfxDesc.ComputePipeline
+                        .of(d.createShaderModule(p.stage(GfxStage.COMPUTE)))
+                        .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
+                        .layout(programLayout(m, name)).named(name));
+            }
+            @Override public boolean has(String name) {
+                PackProgram p = m.program(name);
+                return p != null && p.stageCount() > 0;
+            }
+        };
     }
 }

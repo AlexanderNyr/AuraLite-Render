@@ -108,18 +108,63 @@ public final class PackGraphBuilder {
                         dev.auralite.render.rhi.GfxPipeline pipe = pipelines.computePipeline(programName);
                         if (pipe != null) {
                             ctx.cmd().bindComputePipeline(pipe);
+                            bindImageSets(ctx, programName);
                             ctx.cmd().dispatch(ctx.currentPass().groupsX(),
                                     ctx.currentPass().groupsY(), ctx.currentPass().groupsZ());
                         }
                     } else {
                         dev.auralite.render.rhi.GfxPipeline pipe =
                                 pipelines.rasterPipeline(programName, currentPassDesc(ctx));
-                        if (pipe != null) ctx.cmd().bindGraphicsPipeline(pipe);
+                        if (pipe != null) {
+                            ctx.cmd().bindGraphicsPipeline(pipe);
+                            bindImageSets(ctx, programName);
+                            // One fullscreen triangle per raster pass: the pack
+                            // shaders carry the gl_VertexIndex convention (the
+                            // reference pack's final.vert builds the whole quad
+                            // from it), and stages that declare vertex inputs
+                            // read the standard unbound-attribute constant.
+                            ctx.cmd().draw(3, 1, 0, 0);
+                        }
                     }
                 }
             });
         }
         return g;
+    }
+
+    /**
+     * Binds one descriptor set per set index the program's image declarations
+     * use. Names come from {@link PackProgram#imageDecls()} and resolve
+     * against graph resources by exact equality - a name the graph did not
+     * allocate throws by name here, and a provider that never attached
+     * {@link PackProgram#layout()} is caught by the device's bind validation.
+     * Both are deliberate: the binding contract fails loud, never silent.
+     */
+    private void bindImageSets(dev.auralite.render.graph.GraphContext ctx, String programName) {
+        PackProgram program = manifest.program(programName);
+        if (program == null) return;
+        java.util.List<PackProgram.ImageDecl> decls = program.imageDecls();
+        if (decls.isEmpty()) return;
+        java.util.Map<Integer, dev.auralite.render.rhi.GfxDescriptorSet> sets =
+                new java.util.TreeMap<Integer, dev.auralite.render.rhi.GfxDescriptorSet>();
+        for (PackProgram.ImageDecl d : decls) {
+            dev.auralite.render.rhi.GfxDescriptorSet set = sets.get(d.set);
+            if (set == null) {
+                set = new dev.auralite.render.rhi.GfxDescriptorSet(d.set);
+                sets.put(d.set, set);
+            }
+            if (d.kind == dev.auralite.render.rhi.GfxDesc.PipelineLayout.Kind.STORAGE_IMAGE) {
+                set.add(dev.auralite.render.rhi.GfxDescriptorSet.Write.storageImage(
+                        d.binding, ctx.image(d.name)));
+            } else {
+                throw new dev.auralite.render.rhi.GfxException("pack program '" + programName
+                        + "': combined sampler '" + d.name + "' binds by resource name too, but"
+                        + " the graph's descriptor bridge wires storage images only (yet)");
+            }
+        }
+        for (dev.auralite.render.rhi.GfxDescriptorSet set : sets.values()) {
+            ctx.cmd().bindDescriptorSet(set.setIndex(), set);
+        }
     }
 
     /**
@@ -132,7 +177,16 @@ public final class PackGraphBuilder {
      */
     private GfxDesc.RenderPass currentPassDesc(dev.auralite.render.graph.GraphContext ctx) {
         int[] area = ctx.renderArea();
-        return GfxDesc.RenderPass.of(area[0], area[1]).named(ctx.currentPass().name());
+        GfxDesc.RenderPass rp = GfxDesc.RenderPass.of(area[0], area[1])
+                .named(ctx.currentPass().name());
+        for (dev.auralite.render.graph.GraphAccess a
+                : ctx.currentPass().colorAttachments()) {
+            rp.color(GfxDesc.Attachment.of(ctx.image(a.resource.name())));
+        }
+        dev.auralite.render.graph.GraphAccess d =
+                ctx.currentPass().depthAttachment();
+        if (d != null) rp.depth(GfxDesc.Attachment.of(ctx.image(d.resource.name())));
+        return rp;
     }
 
     /** Maps {@code foo.prev} / {@code foo.cur} onto the history pair's real names. */

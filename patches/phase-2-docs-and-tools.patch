@@ -1,0 +1,986 @@
+From fe530a950def0ce44d0bcf0ac86487b9608fda07 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 09:24:21 +0000
+Subject: [PATCH] Phase 2 - docs + tools: api docs (GRAPH, UNIFORMS, BIOME),
+ packlint, drift-check
+
+docs/api/ now covers the whole public surface: RHI, PACK_FORMAT, GRAPH,
+UNIFORMS, BIOME. tools/packlint exposes the loader's refusals as a CLI
+(exit 1 on error, warnings on stderr, --strict promotes, --null-device
+checks capabilities). tools/drift-check replays the host gate and fails
+when a suite number moves without its doc line.
+---
+ Makefile                                      |  32 ++-
+ README.md                                     |  12 +
+ docs/ROADMAP.md                               |  15 +-
+ docs/STATUS.md                                |  18 +-
+ docs/api/BIOME.md                             | 141 +++++++++++
+ docs/api/GRAPH.md                             | 132 ++++++++++
+ docs/api/UNIFORMS.md                          | 102 ++++++++
+ .../render/tools/drift/DriftCheck.java        | 238 ++++++++++++++++++
+ .../render/tools/packlint/PackLint.java       | 137 ++++++++++
+ 9 files changed, 814 insertions(+), 13 deletions(-)
+ create mode 100644 docs/api/BIOME.md
+ create mode 100644 docs/api/GRAPH.md
+ create mode 100644 docs/api/UNIFORMS.md
+ create mode 100644 tools/drift-check/src/dev/auralite/render/tools/drift/DriftCheck.java
+ create mode 100644 tools/packlint/src/dev/auralite/render/tools/packlint/PackLint.java
+
+diff --git a/Makefile b/Makefile
+index 6c28921..49ba52b 100644
+--- a/Makefile
++++ b/Makefile
+@@ -17,17 +17,20 @@ NULL_CLASSES = $(BUILD)/null
+ GL_CLASSES = $(BUILD)/gl
+ VK_CLASSES = $(BUILD)/vk
+ TEST_CLASSES = $(BUILD)/tests
++TOOLS_CLASSES = $(BUILD)/tools
+ 
+-.PHONY: all deps build test bench clean help
++.PHONY: all deps build test bench packlint drift-check clean help
+ 
+ all: build
+ 
+ help:
+-> @echo "targets: deps build test bench clean"
+-> @echo "  deps  - fetch LWJGL $(LWJGL_VERSION) jars into third_party/ (gitignored, never committed)"
+-> @echo "  build - compile core, backend-null, backend-gl, backend-vulkan, tests"
+-> @echo "  test  - build, then run all six host gates (must end RESULT: PASS)"
+-> @echo "  bench - build, then run the gates 5x and show the timing lines"
++> @echo "targets: deps build test bench packlint drift-check clean"
++> @echo "  deps        - fetch LWJGL $(LWJGL_VERSION) jars into third_party/ (gitignored, never committed)"
++> @echo "  build       - compile core, backend-null, backend-gl, backend-vulkan, tests, tools"
++> @echo "  test        - build, then run all seven host gates (must end RESULT: PASS)"
++> @echo "  bench       - build, then run the gates 5x and show the timing lines"
++> @echo "  packlint    - validate PACK=path (dir or zip); STRICT=1 promotes warnings, NULL_DEVICE=1 checks capabilities"
++> @echo "  drift-check - replay the suite receipts; they must match the doc lines or fail by name"
+ 
+ deps: $(LWJGL_JARS)
+ > @echo "GL46 present: $$(unzip -l $(THIRD_PARTY)/lwjgl-opengl.jar | grep -c 'GL46.class') class(es)"
+@@ -46,7 +49,7 @@ $(THIRD_PARTY)/lwjgl-vulkan.jar:
+ > curl -sSL -o $@ $(MAVEN)/lwjgl-vulkan/$(LWJGL_VERSION)/lwjgl-vulkan-$(LWJGL_VERSION).jar
+ 
+ build: deps
+-> @mkdir -p $(CORE_CLASSES) $(NULL_CLASSES) $(GL_CLASSES) $(VK_CLASSES) $(TEST_CLASSES)
++> @mkdir -p $(CORE_CLASSES) $(NULL_CLASSES) $(GL_CLASSES) $(VK_CLASSES) $(TEST_CLASSES) $(TOOLS_CLASSES)
+ > @echo "--- core (java 11, no dependencies) ---"
+ > find core/src -name '*.java' | sort > $(BUILD)/core-sources.txt
+ > $(JAVAC) -Xlint:-options -d $(CORE_CLASSES) @$(BUILD)/core-sources.txt
+@@ -69,6 +72,9 @@ build: deps
+ > find tests/src -name '*.java' | sort > $(BUILD)/tests-sources.txt
+ > $(JAVAC) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES) \
+       -d $(TEST_CLASSES) @$(BUILD)/tests-sources.txt
++> @echo "--- tools (packlint, drift-check) ---"
++> find tools -name '*.java' | sort > $(BUILD)/tools-sources.txt
++> $(JAVAC) -cp $(CORE_CLASSES):$(NULL_CLASSES) -d $(TOOLS_CLASSES) @$(BUILD)/tools-sources.txt
+ > @echo "build: OK"
+ 
+ # The runtime classpath deliberately omits third_party: the mapping tables are
+@@ -84,5 +90,17 @@ bench: build
+         dev.auralite.render.tests.RunAll --receipts 2>&1 | grep -E '^(TOTAL|RESULT)'; \
+     done
+ 
++# Usage: make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]
++packlint: build
++> @test -n "$(PACK)" || { echo "usage: make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]"; exit 2; }
++> $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(TOOLS_CLASSES) \
++>       dev.auralite.render.tools.packlint.PackLint $(PACK) \
++>       $(if $(STRICT),--strict,) $(if $(NULL_DEVICE),--null-device,)
++
++# Replays the host gate and compares its receipts with docs/STATUS.md and README.md.
++drift-check: build
++> $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(TEST_CLASSES):$(TOOLS_CLASSES) \
++>       dev.auralite.render.tools.drift.DriftCheck
++
+ clean:
+ > rm -rf $(BUILD)
+diff --git a/README.md b/README.md
+index 5d90d40..e35f2fc 100644
+--- a/README.md
++++ b/README.md
+@@ -28,6 +28,12 @@ third_party/     gitignored LWJGL 3.4.3, fetched by `make deps` (compile-only)
+ make deps    # fetch LWJGL 3.4.3 into third_party/ (~11 MB)
+ make test    # build everything, run 7 suites
+ make bench   # run the perf gates 5x
++make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]
++             # validate a pack: exit 1 on error, warnings on stderr,
++             # --strict promotes warnings, --null-device checks capabilities
++make drift-check
++             # replay the suite receipts; numbers that moved without their
++             # doc lines are reported by name and fail the gate
+ ```
+ 
+ Host rule: everything except `fabric/` stays Java 11 source-compatible, so
+@@ -58,6 +64,12 @@ report instead of happening silently. Format authority:
+   and where it plugs into AuraLite-OS and the Emulator
+ - [docs/api/RHI.md](docs/api/RHI.md) — the device contract both backends keep
+ - [docs/api/PACK_FORMAT.md](docs/api/PACK_FORMAT.md) — the pack grammar
++- [docs/api/GRAPH.md](docs/api/GRAPH.md) — the render graph: order, barriers,
++  lifetimes, aliasing
++- [docs/api/UNIFORMS.md](docs/api/UNIFORMS.md) — the pack expression language
++  and the spatial opt-in
++- [docs/api/BIOME.md](docs/api/BIOME.md) — the biome field, the sampler, the
++  LUT and the legacy bake
+ 
+ ## Standing rules
+ 
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+index 043e1b6..baadf23 100644
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -7,22 +7,31 @@ A phase is done when its gate is green, not when its code is written.
+ 
+ RHI, render graph, scene, uniforms, biomes, pack loader, and the recording
+ reference device. Gate: 6 suites green on OpenJDK 11, no GPU.
++Closing patch: `patches/phase-0-core-null.patch` — replayed gate 627/0, 6/6.
+ 
+ ## Phase 1 — backends compile-verified (closed)
+ 
+ GL 4.6 and Vulkan 1.3 devices against LWJGL 3.4.3, same failure vocabulary
+ as NULL, mapping tables pinned by the `tables` suite. Gate: both modules
+ `javac rc=0` on real sources, `make test` 967/0, 7/7 green.
++Closing patch: `patches/phase-1-gl-vulkan-compile-verified.patch` —
++replayed gate 967/0, 7/7 (applying it after Phase 0 rebuilds this tree
++byte-identically).
+ 
+-## Phase 2 — docs + tools (current)
++## Phase 2 — docs + tools (closed)
+ 
+ - `docs/`: README, ROADMAP, STATUS, `api/` (RHI, PACK_FORMAT, GRAPH, UNIFORMS,
+   BIOME), `plans/BIG_PLAN.md` with AuraLite-OS/Emulator links.
+ - `tools/packlint`: the loader's refusals as a CLI — exit non-zero on error,
+-  warnings to stderr, `--strict` promoting warnings.
++  warnings to stderr, `--strict` promoting warnings, `--null-device`
++  capability checking.
+ - `tools/drift-check`: replays the suite receipts and fails when a number
+   moves without its doc line moving too.
+-- Gate: a stranger can validate a pack and explain every refusal from the docs.
++- Gate: a stranger can validate a pack and explain every refusal from the
++  docs. Receipt: a 4-error probe pack is refused with file-and-line reasons
++  and exit 1; a warnings-only probe exits 0 and fails `--strict`; a legacy
++  probe reports coverage; drift-check passes clean and names a deliberately
++  moved count in its negative control.
+ 
+ ## Phase 3 — AuraLite-Native pack
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index d69b1c6..59a7014 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -46,6 +46,18 @@ RESULT: PASS
+   (`SHADER_READ → COMPUTE|FRAGMENT`, `MEMORY → ALL_COMMANDS`).
+   The tables load with no LWJGL on the classpath — inlined constants only.
+ 
++## Tool gates
++
++```
++packlint    valid native pack: OK, exit 0 (capabilities checked via --null-device)
++            broken pack: 4 named errors with file:line, REFUSED, exit 1
++            warnings-only pack: exit 0; with --strict: exit 1
++            legacy pack: OK, coverage 2/40, exit 0
++drift-check 7 suite receipts + TOTAL match docs/STATUS.md and README.md, RESULT: PASS
++            negative control: one graph count moved in a copy of STATUS.md ->
++            named DRIFT line, exit 1
++```
++
+ ## Lanes
+ 
+ | Lane | State |
+@@ -55,11 +67,11 @@ RESULT: PASS
+ | core: util (`Checks`, `MathUtil`, `Extents`) | done, gated |
+ | backend-gl (GL 4.6, LWJGL, compile-verified) | done, compiles rc=0 |
+ | backend-vulkan (VK 1.3, LWJGL, compile-verified) | done, compiles rc=0 |
+-| docs (README, ROADMAP, api/, plans/) | next |
+-| tools (packlint, drift-check) | after docs |
++| docs (README, ROADMAP, api/, plans/) | done — api/ has RHI, PACK_FORMAT, GRAPH, UNIFORMS, BIOME |
++| tools (packlint, drift-check) | done, gated — see Tool gates |
+ | packs/AuraLite-Native | after tools |
+ | fabric/ (Java 21 + Gradle/Loom) | source + json only; build lane SKIPs (needs JDK 21) |
+-| patches/ (one .patch per phase) | at phase close |
++| patches/ (one .patch per phase) | done — `patches/phase-0-core-null.patch` (627/0, 6/6), `patches/phase-1-gl-vulkan-compile-verified.patch` (967/0, 7/7), both replay-verified |
+ 
+ ## Backends (compile-verified, no GPU in this sandbox)
+ 
+diff --git a/docs/api/BIOME.md b/docs/api/BIOME.md
+new file mode 100644
+index 0000000..37bb692
+--- /dev/null
++++ b/docs/api/BIOME.md
+@@ -0,0 +1,141 @@
++# The biome field
++
++`dev.auralite.render.biome`. Iris answers "which biome is this?" with one
++integer sampled at the camera. AuraLite-Render answers with a **volume**: a
++sliding 3D window of biome ids at Minecraft's own granularity of one id per
++4x4x4 blocks, so a fragment 120 blocks away in a swamp asks the volume at its
++own position and gets the swamp while the beach under the camera gets the
++beach — same draw call, same frame. This is the type `BiomeSample` (up to four
++ids with normalised weights) that Iris has no equivalent of.
++
++## The field
++
++`BiomeField` is a flat `int[]` window around the camera, not a sparse map,
++because the access pattern is a strided 8-neighbourhood read at fragment
++rate: flat is cache-friendly, branch-free, and copies to the GPU in one
++sub-image upload. `UNKNOWN = -1` marks cells nothing has ingested yet.
++The window follows the camera in **whole cells** and carries its contents
++across the move, so walking in a straight line costs one new slice of cells
++per 4 blocks rather than a full re-ingest.
++
++`BiomeFieldBuilder` keeps the field in step with the chunks the client has
++loaded. Ingest is one chunk section = 4x4x4 = 64 cells — exactly Minecraft's
++biome container granularity, so nothing is resampled and nothing is lost.
++Sections outside the vertical range are rejected and counted; changed cells
++become `DirtyRegion` boxes, coalesced deterministically (greedy: merge the
++touching pair whose union wastes the least volume) so a chunk border crossing
++does not produce dozens of one-cell GPU uploads.
++
++## Sampling — and the one-cell seam
++
++`BiomeSampler` does trilinear interpolation over the eight cells surrounding
++the position, cell centres at `(c + 0.5) * cellSize`. Duplicate ids merge,
++contributors sort by weight, the top `BiomeSample.MAX_ENTRIES = 4` are kept
++and renormalised: weights always sum to 1, the dominant biome is entry 0.
++Cells never ingested contribute nothing; when all eight are unknown the
++sample is empty and callers fall back to the registry default rather than
++inventing a biome.
++
++**The seam is exactly one biome cell (4 blocks), and that is a structural
++fact, not a tunable.** Trilinear interpolation consults the two cells either
++side of the position on each axis; a position more than one cell from a
++border cannot see it. An earlier revision carried a `blendRadius` knob that
++appeared to widen the seam; measurement showed it only reweighted the same
++eight corners and never reached a further cell, so it was removed rather than
++left as a control that lies. Widening a seam is done where it is cheap — a
++compute-pass blur over the baked property volume (BIOME_PLAN B5) — not by
++widening a per-fragment CPU kernel.
++
++## The registry
++
++`BiomeRegistry` maps id ↔ record **in registration order**: Iris hands a pack
++`BIOME_PLAINS` and friends as small integers derived from registry order, so
++the built-in vanilla table is seeded in that order (48 entries,
++`vanillaDefaults()`) and modded biomes are appended as the game registers
++them. Ids are stable for a world load, not across versions — which is why the
++native pack format refers to biomes by `registryKey` and resolves at load.
++The fallback record for unknown ids is `BIOME_PLAINS`. `bindConstants`
++exposes every `BIOME_*`, `CAT_*` and `PPT_*` to the expression environment;
++water and fog colours are seeded from AuraLite-Shaders v1.2.0, the reference
++pack. The fabric glue overwrites colours from the live registry.
++
++## The LUT
++
++`BiomeLut` is the property table as a 2D texture — one texel column per biome
++id, five RGBA32F rows, fetched by id in the shader with zero CPU involvement:
++
++```
++row 0  WATER_COLOR      rgb = linear water colour          a = 1.0
++row 1  WATER_FOG_COLOR  rgb = linear water fog colour      a = fogDensityScale
++row 2  FOLIAGE_COLOR    rgb = linear foliage tint          a = temperature
++row 3  GRASS_COLOR      rgb = linear grass tint            a = downfall
++row 4  META             r = biome id, g = category, b = precipitation, a = cloudCoverageScale
++```
++
++Width is padded to a power of two; `LAYOUT_VERSION` goes up if a row changes
++meaning and the native pack format refuses a pack built against a different
++one.
++
++## Packing to the GPU
++
++`BiomeFieldPacker` packs the whole field into uploadable texels. Two layouts,
++because they trade different things:
++
++- **`ID_R32UI`** — one 32-bit id per cell. Exact, any id a modded registry
++  can produce; the shader does its own trilinear blend from eight fetches
++  plus eight LUT fetches.
++- **`TOPK_RGBA8UI`** — the four most likely ids per cell plus a matching
++  RGBA8 weight texture. One fetch instead of eight, a quarter of the
++  bandwidth, a hard ceiling of **254** biome ids. The packer refuses higher
++  ids with a named reason rather than silently truncating
++  (`TOPK_RGBA8UI cannot represent biome id 300; … Use ID_R32UI`).
++
++Unknown cells pack as `0xFFFFFFFF` / `255`. `subImageBoxes` clips dirty
++regions to the window, so a chunk load on the far side of the window touches
++no GPU memory at all; `bytesForBoxes` prices the upload for the receipts.
++
++## Baking legacy expressions — one pack, many biomes
++
++`BiomeBake` is the compatibility story for "more than one biome", and it needs
++no pack edits. A legacy pack writes
++
++```
++variable.float.waterColorR = if(in(biome, BIOME_SWAMP), 0.38, in(biome, BIOME_LUKEWARM_OCEAN), 0.271, 0.247)
++uniform.vec3.waterColor    = vec3(waterColorR, waterColorG, waterColorB)
++```
++
++Iris evaluates that once per frame with `biome` bound to the camera's biome:
++one water colour for the whole screen. Here the same expression is evaluated
++once per field cell with `biome` bound to that cell's id — plus `temperature`,
++`rainfall`, `biome_category`, `biome_precipitation` for expressions that read
++those — and uploaded as an RGBA32F volume. Under the spatial opt-in (see
++[UNIFORMS.md](UNIFORMS.md)) the pack gets spatially varying water colour, fog
++and foliage **without a single line changed**. Unknown cells bake as the
++fallback biome; a definition that fails to evaluate bakes zero and is
++counted. `smooth()` in a baked definition is evaluated once, frozen, with a
++warning.
++
++## Receipts (from `make test`, `biome` suite)
++
++```
++field: BiomeField{cell=4, window=8x4x8, origin=(0,0,0), filled=1/256, v2}
++water colour across a swamp|plains border in ONE frame:
++  x= 6.0 swamp   (0.380, 0.482, 0.392)  contributors=1
++  x=15.0 blend   (0.347, 0.477, 0.517)  contributors=2
++  x=17.0 blend   (0.280, 0.468, 0.768)  contributors=2
++  x=26.0 plains  (0.247, 0.463, 0.894)  contributors=1
++seam: pure swamp at x<=14, blended 14<x<18, pure plains at x>=18
++      (one 4-block biome cell, which is Minecraft's own granularity)
++lut: BiomeLut{64x5 RGBA32F, 5120 B, layout v1}
++registry capacity: TOPK tops out at 254 ids; 300 modded biomes require ID_R32UI
++coalesce: 64 cells -> [0,0,0 +4x4x4]
++bake: one unmodified legacy expression -> 2 spatially distinct water colours
++      in a 8x4x8 volume (4096 B). Iris can express 1.
++bake: 8x4x8 cells, 256 evaluations, 0 unknown, 4096 B
++window for render distance 2: 23x97x23 cells = 205252 B
++biome ingest: 1 sections accepted, 2 rejected, 0 cached, 0/51313 cells filled,
++              2 window moves
++```
++
++Seven sample positions, five distinct colours, three strictly intermediate:
++the blend is real, and the seam is structurally one 4-block cell.
+diff --git a/docs/api/GRAPH.md b/docs/api/GRAPH.md
+new file mode 100644
+index 0000000..d972bd6
+--- /dev/null
++++ b/docs/api/GRAPH.md
+@@ -0,0 +1,132 @@
++# The render graph
++
++`dev.auralite.render.graph`. A pack declares what each pass reads and writes;
++the compiler derives order, barriers, lifetimes and memory from those
++declarations. Compilation is pure CPU work with no device calls, which is what
++makes the whole pipeline testable on a machine with no GPU. Authority for the
++pack-side spelling: [PACK_FORMAT.md](PACK_FORMAT.md); this doc is the
++semantics those spellings compile to.
++
++## The pipeline
++
++```
++RenderGraph (builder, rebuilt on pack/resize/option change)
++    -- GraphCompiler.compile() -->
++CompiledGraph (immutable: ordered passes, barriersByPass, lifetimes, stats)
++    -- allocate(device), execute per frame -->
++GraphContext (per-pass body: device, cmd, frame, resources)
++```
++
++One compiled graph is reused for every frame at a given size. A resize or an
++option change recompiles; nothing else invalidates it.
++
++## Declaring
++
++- **Resources** are textures or buffers the graph owns, or imported ones (the
++  backbuffer, a host texture). Imported resources are never reallocated and
++  never aliased — that is how the Minecraft glue hands the renderer a
++  framebuffer it does not own. A zero width/height means "framebuffer-sized"
++  and is resolved against the compile-time extents.
++- **Passes** are `RASTER`, `COMPUTE` or `COPY`. A raster pass declares colour
++  attachments (slots in declaration order) and/or a depth attachment; a
++  compute pass declares a dispatch extent; every pass declares reads and
++  writes with an access mask from `GfxEnums.Access`.
++- **History pairs** (`GraphHistory`) are honest ping-pong: a pass reads
++  `previous()` and writes `current()`, and the frame swaps the two bindings
++  after execution. Declaring "pass X reads what pass X writes" would be a real
++  cycle; the pair keeps the graph acyclic while carrying TAA-style feedback.
++  Two frames later the bindings are back where they started — the B-lane gate
++  asserts exactly that.
++- **Conditions and keeps**: a pass disabled by an option records why
++  (`unused_debug -- option 'DEBUG_VIEW' is off`); a pass that must survive
++  culling despite having no kept consumer marks `keep(why)`.
++
++## Compilation — six derivations, in order
++
++1. **Validation.** A broken pack is refused here, not at first draw, with a
++   named reason: no accesses, no body, raster pass with neither colour nor
++   depth, colour slot duplicates, non-colour colour attachment, non-depth
++   depth attachment, dispatch beyond the device work-group limits, resources
++   beyond texture limits. Reads no enabled pass produces are never silent —
++   they are warnings; history sides are exempt by construction.
++2. **Edges.** RAW (writer → reader) and WAW (earlier writer → later writer)
++   from the declarations, plus writer-of-one-history-side → reader-of-the-other
++   so a temporal producer is not culled. **WAR is deliberately not an edge**:
++   a read that must precede a later write of the same resource would
++   contradict the RAW edge of the same pair and manufacture a cycle out of an
++   ordinary "read the imported framebuffer, then overwrite it" pass. That was
++   measured, not assumed. Such pairs fall back to the declaration-index
++   tie-break.
++3. **Cycle detection.** DFS reports the offending path by name
++   (`a -> b -> c -> a`).
++4. **Culling.** Kept = external or explicitly kept, closed over predecessors.
++   Everything else is culled with its reason
++   (`producer_dead -- no external output and no kept consumer`).
++5. **Order.** Kahn's algorithm over the kept subgraph; ties break by the lower
++   declaration index, so two compiles of the same pack are byte-identical.
++   A pack may declare `present` first and it still runs last.
++6. **Lifetimes, aliasing, barriers.** First/last ordered position per
++   resource; alias groups pair non-overlapping lifetimes with compatible
++   descs (type, format, samples, mips) — longest-lived anchor the group; the
++   barrier list is derived by walking the ordered passes with a state machine.
++
++## Barriers
++
++Each resource carries a `ResourceState` and an access mask. When a pass's
++access implies a different state, a `Barrier` is planned before that pass;
++a transition whose state and access pair are unchanged is a no-op and is
++suppressed (counted, never silent). Imported present-usage resources start in
++`PRESENT`/`MEMORY_READ`; anything whose usage includes `IMAGE_PRESENT` gets a
++tail transition back to `PRESENT`. The GL backend turns a barrier into at
++most a matching `glMemoryBarrier` and often nothing; the Vulkan backend turns
++it into a `VkImageMemoryBarrier2`/buffer barrier. Same list either way, which
++is what lets the parity gate diff the two lanes.
++
++## Execution
++
++`CompiledGraph.allocate(device)` creates the owned resources;
++`execute(cmd, ...)` walks the ordered passes, emits each pass's barrier list,
++and runs the pass body with a `GraphContext`. The context provides:
++
++- `beginRasterPass()` — builds the render pass from the current pass's
++  declared attachments. The render **area** is the smallest attached image
++  (mip level accounted): a 256x256 cloud-shadow pass and a 2048x2048 shadow
++  pass live in the same graph as the 1920x1080 lighting pass, and each gets
++  the area its attachments imply. The viewport and scissor follow the area —
++  a 256x256 pass with a 1920x1080 viewport draws nothing.
++- `image(name)` / `buffer(name)` — the allocated handle, or a `GraphException`
++  naming the resource and the pass.
++- `frame()` — the `FrameContext` (camera, frustum, weather, …) every pass
++  shares; `put/get` — a scratch map for per-frame values that are not graph
++  resources.
++
++After the last pass, history pairs swap bindings. `release()` clears the
++allocations for a recompile.
++
++## The error vocabulary
++
++`GraphException` always names the pass (or the resource) and what is wrong.
++Nothing in this package throws a bare `IllegalStateException`.
++
++## Receipts (from `make test`, `graph` suite)
++
++```
++order: [cloud_shadow, shadow_map, terrain, ssao, lighting, taa_resolve, present]
++culling: producer_dead -- no external output and no kept consumer
++barriers: 14 planned, 0 suppressed
++lifetime shadow_depth: shadow_depth [1..2] g-1
++aliasing: 1 groups, 2097152 B reclaimable
++passes: 8 declared, 7 enabled, 7 ordered, 0 culled
++  kinds: 6 raster, 1 compute, 0 copy
++resources: 8 declared, 1 imported, 0 transient
++memory: 79116288 B owned textures, 8294400 B imported, 0 B buffers
++barriers: 14 emitted, 0 suppressed as no-ops
++edges: 8
++  disabled: unused_debug -- option 'DEBUG_VIEW' is off
++  warning: resource 'taa.1' is a history side: written last frame, read this frame
++null device: images=8 commands=39 barriers=13
++```
++
++Aliasing is computed and reported today; allocations are not yet shared
++between group members (that is PIPELINE_PLAN P4, and the compiler says so in
++its warnings rather than pretending the memory is saved).
+diff --git a/docs/api/UNIFORMS.md b/docs/api/UNIFORMS.md
+new file mode 100644
+index 0000000..17d41e2
+--- /dev/null
++++ b/docs/api/UNIFORMS.md
+@@ -0,0 +1,102 @@
++# Custom-uniform expressions
++
++`dev.auralite.render.uniform`. The expression language a pack writes in
++`shaders.properties` (`uniform.*` / `variable.*`) and the same parser the
++native format reuses for extent expressions like
++`dispatch=ceil(width/16),ceil(height/16),1`. Behaviour-compatible with what
++Iris/OptiFine evaluate on the CPU — the parity gate diffs this evaluator's
++output against recorded Iris results — with one documented extension and two
++documented semantic decisions.
++
++## Grammar
++
++Recursive descent; precedence lowest → highest:
++
++```
++||  &&  == !=  < <= > >=  + -  * / %  unary(-,!)  primary
++```
++
++Primary: identifiers, decimal and hex (`0x…`) literals, `pi`, `true`/`false`,
++parentheses, function calls. Unknown identifiers and trailing input are
++refusals with the offset inside the expression text
++(`unknown identifier 'wat' at offset 12 in '…'`), never a bare NPE.
++
++**Integer vs float division is a measured decision.** `+ - * %` on two ints
++stay ints, as in GLSL. `/` does **not**: GLSL refuses `int/int` outright and
++every pack author who writes `ceil(width/16)` means float division. An earlier
++revision floored first; that made `ceil()` a no-op and dropped the last
++partial row and column of every compute dispatch — at 1920x1080 with a 16x16
++group, the bottom 8 rows of AO were never computed and nothing complained.
++`/` therefore yields a float even from two ints.
++
++`&&`/`||` do **not** short-circuit: both sides are evaluated, matching Iris's
++CPU evaluator.
++
++## Values
++
++`Value` kinds: `BOOL`, `INT`, `FLOAT`, `VEC2`, `VEC3`, `VEC4`. Component-wise
++arithmetic widens to the larger side; comparisons and equality operate on the
++first component (bools compare as bools); equality is approximate (1e-9).
++
++## Functions
++
++| Call | Semantics |
++|---|---|
++| `if(c1, v1, c2, v2, …, else)` | Variadic, not ternary: odd argument count ≥ 3, condition/value pairs, trailing else. Branches evaluate lazily pair-by-pair, so `smooth()` state does not advance on a branch that was not taken. `select` is an alias. |
++| `in(v, a, b, …)` | True when `v` equals any candidate. This is what `in(biome, BIOME_SWAMP)` compiles to. |
++| `smooth(id, expr, rate[, rateDown])` | Per-call-site temporal filter, state keyed by the `id` expression's source text. Exponential approach scaled by frame time: `k = 1 - exp(-r * dt)`, `value += (target - value) * k`; `rateDown` is used when the target falls. First evaluation snaps to the target. Advances at most once per frame id. |
++| `vec2/vec3/4(a, …)` | Vector constructors, component count checked. |
++| `blendWeights(w1, w2, …)` | **AuraLite extension.** Clamps weights ≥ 0 and renormalises to sum 1 (uniform when the sum is 0). Exists so a legacy per-biome `variable.float.waterColorR` chain can be re-evaluated per biome cell and blended — see [BIOME.md](BIOME.md). |
++| maths | `abs sign floor ceil round fract trunc sin cos tan asin acos atan atan2 exp exp2 log log2 sqrt inversesqrt pow mod min max clamp mix lerp step smoothstep radians degrees length distance dot` — arity-checked, `lerp` aliases `mix`. |
++
++`FunctionTable.setFrame(frameId, deltaSeconds)` drives `smooth()`; the default
++delta is 1/60 s.
++
++## The definition table
++
++`CustomUniformTable` holds `uniform.<type>.<name>` and
++`variable.<type>.<name>` definitions **in declaration order**, because a
++variable may feed a later uniform — that is exactly how AuraLite-Shaders
++builds its water colour, so order is part of the semantics and is preserved
++verbatim in both pack modes. `<name>.transition` lines set OptiFine's biome
++transition time on the following definition. Definitions that fail to parse
++are collected as `problems()` and surface as load warnings, not crashes.
++
++An `ExprEnv` carries the bindings for one evaluation and is reused across a
++frame (bindings overwritten in place — the legacy path is allocation-free).
++Built-in bindings a pack expression may see: frame time and counters, viewport
++and `width`/`height`, and — on the spatial path — `biome`, `temperature`,
++`rainfall`, `biome_category`, `biome_precipitation`, plus every `BIOME_*`,
++`CAT_*` and `PPT_*` constant bound by `BiomeRegistry.bindConstants`.
++
++## The spatial opt-in
++
++Legacy biome-dependent expressions evaluate once per frame with `biome`
++bound to the camera's biome — one colour for the whole screen. With the
++opt-in (`shaders.properties` host flag `auralite.spatialBiomeUniforms=true`,
++native `[biome] spatialUniforms=true`), the same expression is re-evaluated
++per biome-field cell at bake time and uploaded as a 3D volume the shader
++samples at its own world position. Two semantic differences are **recorded,
++not hidden**:
++
++- `smooth()` is evaluated once and frozen (a per-cell temporal filter is not
++  what the pack author meant) — a warning says so;
++- `.transition` times are ignored, because the spatial blend replaces them.
++
++The opt-in injects an `AURALITE_SPATIAL_BIOME` option (default false) so the
++choice is visible in the option table rather than being magic.
++
++## Receipts (from `make test`, `uniform` suite)
++
++```
++smooth(t1, 0->1, rate=4): frame1=0.064493 frame2=0.124827
++waterColor(swamp)  = (0.380, 0.482, 0.392)
++waterColor(plains) = (0.247, 0.463, 0.894)
++waterColor(meadow) = (0.055, 0.306, 0.812)
++waterColor(warm_ocean) = (0.263, 0.835, 0.933)
++if(): variadic chain of 28 comma-separated parts accepted
++```
++
++The 28-part chain is AuraLite-Shaders' water-colour `if()` evaluated verbatim
++— a first implementation that required exactly three arguments refused the
++pack outright.
+diff --git a/tools/drift-check/src/dev/auralite/render/tools/drift/DriftCheck.java b/tools/drift-check/src/dev/auralite/render/tools/drift/DriftCheck.java
+new file mode 100644
+index 0000000..26b6218
+--- /dev/null
++++ b/tools/drift-check/src/dev/auralite/render/tools/drift/DriftCheck.java
+@@ -0,0 +1,238 @@
++package dev.auralite.render.tools.drift;
++
++import java.io.BufferedReader;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.nio.charset.StandardCharsets;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++import java.util.ArrayList;
++import java.util.LinkedHashMap;
++import java.util.List;
++import java.util.Map;
++import java.util.concurrent.TimeUnit;
++import java.util.regex.Matcher;
++import java.util.regex.Pattern;
++
++/**
++ * Suite receipts may not move without their doc lines moving too.
++ *
++ * <p>Replays the host gate ({@code RunAll --receipts}) in a subprocess on this
++ * tool's own classpath, parses the per-suite and TOTAL receipts, and compares
++ * them against the numbers the docs currently claim:
++ *
++ * <ul>
++ * <li>{@code docs/STATUS.md} -- per-suite counts AND the TOTAL line;</li>
++ * <li>{@code README.md} -- the TOTAL line.</li>
++ * </ul>
++ *
++ * <p>Any mismatch is printed as a named drift (suite, field, receipt value,
++ * doc value, doc file) and the exit code is 1. Exit 0 means every tracked
++ * number in the docs is the number the gates actually produce. Exit 2 means
++ * the check itself could not run (missing files, a red host gate, a crashed
++ * subprocess) -- a broken gate is never reported as "no drift".
++ *
++ * <p>Timings are deliberately not tracked: the receipt is the counts plus
++ * PASS, never microseconds.
++ */
++public final class DriftCheck {
++
++    // suite line with timing (fresh run): "rhi         51 passed   0 failed   0 NC   52640 us  PASS"
++    private static final Pattern RUN_SUITE = Pattern.compile(
++            "^(\\w+)\\s+(\\d+) passed\\s+(\\d+) failed\\s+(\\d+) NC\\s+\\d+ us\\s+(PASS|FAIL)\\s*$");
++    // suite line in STATUS.md (timings excluded): "rhi         51 passed   0 failed   0 NC   PASS"
++    private static final Pattern DOC_SUITE = Pattern.compile(
++            "^(\\w+)\\s+(\\d+) passed\\s+(\\d+) failed\\s+(\\d+) NC\\s+(PASS|FAIL)\\s*$");
++    // TOTAL in a fresh run: "... suites green, 1003119 us"
++    private static final Pattern RUN_TOTAL = Pattern.compile(
++            "^TOTAL (\\d+) passed, (\\d+) failed, (\\d+) negative controls, (\\d+)/(\\d+) suites green(?:, \\d+ us)?\\s*$");
++    // README quotes the same numbers without the "TOTAL " prefix, mid-sentence.
++    private static final Pattern PROSE_TOTAL = Pattern.compile(
++            "(\\d+) passed, (\\d+) failed, (\\d+) negative controls, (\\d+)/(\\d+) suites green");
++
++    static final class SuiteReceipt {
++        final String name;
++        final int passed, failed, nc;
++        final boolean pass;
++        SuiteReceipt(String name, int passed, int failed, int nc, boolean pass) {
++            this.name = name; this.passed = passed; this.failed = failed; this.nc = nc; this.pass = pass;
++        }
++    }
++
++    static final class TotalReceipt {
++        final int passed, failed, nc, green, count;
++        TotalReceipt(int passed, int failed, int nc, int green, int count) {
++            this.passed = passed; this.failed = failed; this.nc = nc; this.green = green; this.count = count;
++        }
++        String compact() { return passed + "/" + failed + ", " + green + "/" + count; }
++    }
++
++    private DriftCheck() { }
++
++    public static void main(String[] args) throws Exception {
++        Path status = Paths.get("docs/STATUS.md");
++        Path readme = Paths.get("README.md");
++        for (int i = 0; i < args.length; i++) {
++            if (args[i].equals("--status") && i + 1 < args.length) status = Paths.get(args[++i]);
++            else if (args[i].equals("--readme") && i + 1 < args.length) readme = Paths.get(args[++i]);
++            else {
++                System.err.println("drift-check: unknown argument '" + args[i] + "'");
++                System.err.println("usage: drift-check [--status docs/STATUS.md] [--readme README.md]");
++                System.exit(2);
++            }
++        }
++
++        if (!Files.isRegularFile(status) || !Files.isRegularFile(readme)) {
++            System.err.println("drift-check: cannot find " + status + " and/or " + readme
++                    + "; run from the repository root");
++            System.exit(2);
++        }
++
++        // ---- replay the host gate on this tool's own classpath ----------------
++        String javaBin = System.getProperty("java.home") + java.io.File.separator + "bin" + java.io.File.separator + "java";
++        ProcessBuilder pb = new ProcessBuilder(javaBin, "-cp", System.getProperty("java.class.path"),
++                "dev.auralite.render.tests.RunAll", "--receipts");
++        pb.redirectErrorStream(true);
++        Process proc = pb.start();
++        List<String> lines = new ArrayList<String>();
++        BufferedReader br = new BufferedReader(new InputStreamReader(proc.getInputStream(), StandardCharsets.UTF_8));
++        String line;
++        while ((line = br.readLine()) != null) lines.add(line);
++        if (!proc.waitFor(10, TimeUnit.MINUTES)) { proc.destroyForcibly(); System.exit(2); }
++        int runExit = proc.exitValue();
++
++        Map<String, SuiteReceipt> runSuites = new LinkedHashMap<String, SuiteReceipt>();
++        TotalReceipt runTotal = null;
++        for (String l : lines) {
++            Matcher s = RUN_SUITE.matcher(l);
++            if (s.matches()) {
++                runSuites.put(s.group(1), new SuiteReceipt(s.group(1),
++                        Integer.parseInt(s.group(2)), Integer.parseInt(s.group(3)),
++                        Integer.parseInt(s.group(4)), s.group(5).equals("PASS")));
++                continue;
++            }
++            Matcher t = RUN_TOTAL.matcher(l);
++            if (t.matches()) {
++                runTotal = new TotalReceipt(Integer.parseInt(t.group(1)), Integer.parseInt(t.group(2)),
++                        Integer.parseInt(t.group(3)), Integer.parseInt(t.group(4)), Integer.parseInt(t.group(5)));
++            }
++        }
++        if (runTotal == null || runSuites.isEmpty()) {
++            System.err.println("drift-check: could not parse the replayed receipts; raw output:");
++            for (String l : lines) System.err.println("  | " + l);
++            System.exit(2);
++        }
++        if (runExit != 0) {
++            System.err.println("drift-check: the host gate itself is red (exit " + runExit
++                    + ", " + runTotal.passed + " passed / " + runTotal.failed + " failed);"
++                    + " fix the gate before asking about drift");
++            System.exit(2);
++        }
++
++        // ---- parse the docs ---------------------------------------------------
++        Map<String, SuiteReceipt> statusSuites = new LinkedHashMap<String, SuiteReceipt>();
++        List<TotalReceipt> statusTotals = new ArrayList<TotalReceipt>();
++        List<TotalReceipt> readmeTotals = new ArrayList<TotalReceipt>();
++        parseDoc(status, DOC_SUITE, true, statusSuites, statusTotals);
++        parseProse(readme, readmeTotals);
++
++        // ---- compare -----------------------------------------------------------
++        List<String> drifts = new ArrayList<String>();
++
++        for (SuiteReceipt r : runSuites.values()) {
++            SuiteReceipt d = statusSuites.get(r.name);
++            if (d == null) {
++                drifts.add("suite '" + r.name + "': receipts say " + r.passed + " passed, docs/STATUS.md has no line for it");
++                continue;
++            }
++            if (d.passed != r.passed) drifts.add("suite '" + r.name + "': receipts say " + r.passed
++                    + " passed, docs/STATUS.md says " + d.passed);
++            if (d.failed != r.failed) drifts.add("suite '" + r.name + "': receipts say " + r.failed
++                    + " failed, docs/STATUS.md says " + d.failed);
++            if (d.nc != r.nc) drifts.add("suite '" + r.name + "': negative controls drifted: receipts "
++                    + r.nc + ", docs " + d.nc);
++            if (d.pass && !r.pass) drifts.add("suite '" + r.name + "': receipts say FAIL, docs/STATUS.md says PASS");
++        }
++        for (String name : statusSuites.keySet()) {
++            if (!runSuites.containsKey(name)) {
++                drifts.add("suite '" + name + "': docs/STATUS.md lists it, the replayed gate does not run it");
++            }
++        }
++
++        if (statusTotals.isEmpty()) {
++            drifts.add("docs/STATUS.md: no TOTAL line to compare against");
++        }
++        for (TotalReceipt d : statusTotals) {
++            if (d.passed != runTotal.passed) drifts.add("TOTAL passed: receipts say " + runTotal.passed
++                    + ", docs/STATUS.md says " + d.passed);
++            if (d.failed != runTotal.failed) drifts.add("TOTAL failed: receipts say " + runTotal.failed
++                    + ", docs/STATUS.md says " + d.failed);
++            if (d.nc != runTotal.nc) drifts.add("TOTAL negative controls: receipts say " + runTotal.nc
++                    + ", docs/STATUS.md says " + d.nc);
++            if (d.green != runTotal.green || d.count != runTotal.count) drifts.add("TOTAL suites: receipts say "
++                    + runTotal.green + "/" + runTotal.count + ", docs/STATUS.md says " + d.green + "/" + d.count);
++        }
++        if (readmeTotals.isEmpty()) {
++            drifts.add("README.md: no TOTAL line to compare against");
++        }
++        for (TotalReceipt d : readmeTotals) {
++            if (d.passed != runTotal.passed) drifts.add("TOTAL passed: receipts say " + runTotal.passed
++                    + ", README.md says " + d.passed);
++            if (d.failed != runTotal.failed) drifts.add("TOTAL failed: receipts say " + runTotal.failed
++                    + ", README.md says " + d.failed);
++            if (d.nc != runTotal.nc) drifts.add("TOTAL negative controls: receipts say " + runTotal.nc
++                    + ", README.md says " + d.nc);
++            if (d.green != runTotal.green || d.count != runTotal.count) drifts.add("TOTAL suites: receipts say "
++                    + runTotal.green + "/" + runTotal.count + ", README.md says " + d.green + "/" + d.count);
++        }
++
++        // ---- report ------------------------------------------------------------
++        if (!drifts.isEmpty()) {
++            for (String d : drifts) System.err.println("DRIFT: " + d);
++            System.err.println("drift-check: " + drifts.size() + " drift(s); move the doc line with the number,"
++                    + " or the number with the doc line");
++            System.exit(1);
++        }
++        System.out.println("drift-check: " + runSuites.size() + " suite receipts + TOTAL match "
++                + status + " and " + readme);
++        System.out.println("drift-check: TOTAL " + runTotal.passed + " passed, " + runTotal.failed
++                + " failed, " + runTotal.nc + " negative controls, " + runTotal.green + "/" + runTotal.count
++                + " suites green");
++        System.out.println("RESULT: PASS");
++        System.exit(0);
++    }
++
++    /** Parses suite lines and TOTAL lines out of a doc, keeping file/line context out of scope (names are enough). */
++    private static void parseDoc(Path file, Pattern suitePattern, boolean perSuite,
++                                 Map<String, SuiteReceipt> suites, List<TotalReceipt> totals) throws IOException {
++        for (String l : Files.readAllLines(file, StandardCharsets.UTF_8)) {
++            Matcher s = suitePattern.matcher(l);
++            if (perSuite && s.matches()) {
++                String name = s.group(1);
++                // The doc TOTAL would not match DOC_SUITE; skip anything that reads like prose.
++                if (name.equals("TOTAL")) continue;
++                suites.put(name, new SuiteReceipt(name,
++                        Integer.parseInt(s.group(2)), Integer.parseInt(s.group(3)),
++                        Integer.parseInt(s.group(4)), s.group(5).equals("PASS")));
++                continue;
++            }
++            Matcher t = RUN_TOTAL.matcher(l);
++            if (t.matches()) {
++                totals.add(new TotalReceipt(Integer.parseInt(t.group(1)), Integer.parseInt(t.group(2)),
++                        Integer.parseInt(t.group(3)), Integer.parseInt(t.group(4)), Integer.parseInt(t.group(5))));
++            }
++        }
++    }
++
++    /** Finds every prose TOTAL ("967 passed, 0 failed, ...") anywhere in the file. */
++    private static void parseProse(Path file, List<TotalReceipt> totals) throws IOException {
++        for (String l : Files.readAllLines(file, StandardCharsets.UTF_8)) {
++            Matcher t = PROSE_TOTAL.matcher(l);
++            while (t.find()) {
++                totals.add(new TotalReceipt(Integer.parseInt(t.group(1)), Integer.parseInt(t.group(2)),
++                        Integer.parseInt(t.group(3)), Integer.parseInt(t.group(4)), Integer.parseInt(t.group(5))));
++            }
++        }
++    }
++}
+diff --git a/tools/packlint/src/dev/auralite/render/tools/packlint/PackLint.java b/tools/packlint/src/dev/auralite/render/tools/packlint/PackLint.java
+new file mode 100644
+index 0000000..36bbcd4
+--- /dev/null
++++ b/tools/packlint/src/dev/auralite/render/tools/packlint/PackLint.java
+@@ -0,0 +1,137 @@
++package dev.auralite.render.tools.packlint;
++
++import dev.auralite.render.backend.nulldev.NullDevice;
++import dev.auralite.render.pack.PackFormat;
++import dev.auralite.render.pack.PackLoader;
++import dev.auralite.render.pack.PackLoadReport;
++import dev.auralite.render.pack.PackManifest;
++import dev.auralite.render.pack.PackSource;
++import dev.auralite.render.rhi.GfxDevice;
++
++import java.io.PrintStream;
++import java.nio.file.Files;
++import java.nio.file.Path;
++import java.nio.file.Paths;
++
++/**
++ * The loader's refusals as a CLI.
++ *
++ * <p>Every refusal {@link PackLoader} can issue, explained with the file and
++ * line it came from, without a GPU and without the game. Exit contract:
++ *
++ * <ul>
++ * <li>0 -- the pack loads; warnings (if any) are on stderr;</li>
++ * <li>1 -- the pack is refused (errors), or {@code --strict} promoted a
++ *       warning;</li>
++ * <li>2 -- the tool could not run (bad arguments, unreadable path).</li>
++ * </ul>
++ *
++ * <p>Usage: {@code packlint [--strict] [--null-device] <pack-dir-or-zip>}.
++ * Without {@code --null-device} the load is format-level only (the loader's
++ * own note says so); with it, required capabilities are also checked against
++ * the NULL device's full capability set -- the spec every backend must back.
++ */
++public final class PackLint {
++
++    private PackLint() { }
++
++    public static void main(String[] args) {
++        boolean strict = false;
++        boolean nullDevice = false;
++        String packPath = null;
++        for (String a : args) {
++            if (a.equals("--strict")) strict = true;
++            else if (a.equals("--null-device")) nullDevice = true;
++            else if (a.equals("--help") || a.equals("-h")) { usage(System.out); return; }
++            else if (a.startsWith("-")) { System.err.println("packlint: unknown flag '" + a + "'"); usage(System.err); System.exit(2); }
++            else if (packPath == null) packPath = a;
++            else { System.err.println("packlint: unexpected argument '" + a + "'"); System.exit(2); }
++        }
++        if (packPath == null) {
++            System.err.println("packlint: no pack path given");
++            usage(System.err);
++            System.exit(2);
++        }
++
++        Path p = Paths.get(packPath);
++        if (!Files.exists(p)) {
++            System.err.println("packlint: '" + packPath + "' does not exist");
++            System.exit(2);
++        }
++
++        PackSource source;
++        try {
++            source = Files.isDirectory(p) ? new PackSource.Directory(p) : new PackSource.Zip(p);
++        } catch (Exception e) {
++            System.err.println("packlint: cannot open '" + packPath + "': " + e.getMessage());
++            System.exit(2);
++            return;
++        }
++
++        GfxDevice device = null;
++        NullDevice nullDev = null;
++        if (nullDevice) {
++            nullDev = new NullDevice();
++            device = nullDev;
++        }
++
++        int exit;
++        try {
++            PackLoader loader = new PackLoader(source);
++            boolean ok = loader.load(device);
++            PackManifest m = loader.manifest();
++            PackLoadReport r = loader.report();
++
++            PrintStream out = System.out;
++            out.println("packlint: " + source.origin());
++            out.println("  format:  " + (m.format == null ? "<undetected>" : m.format));
++            out.println("  name:    " + m.name + " " + m.version
++                    + (m.author.isEmpty() ? "" : " by " + m.author));
++            out.println("  api:     " + m.apiLevel);
++            out.println("  programs:" + m.programCount()
++                    + (m.format == PackFormat.LEGACY_IRIS
++                            ? ", coverage " + loader.legacyCoverage().size()
++                              + "/" + PackLoader.LEGACY_CORE_PROGRAMS.size()
++                            : ""));
++            out.println("  options: " + m.optionCount());
++            if (!m.requiredCapabilities.isEmpty()) {
++                out.println("  requires:" + m.requiredCapabilities);
++            }
++            out.print(r.receipt());
++
++            boolean warned = r.warningCount() > 0;
++            if (!r.errors().isEmpty()) {
++                for (String e : r.errors()) System.err.println("ERROR: " + e);
++            }
++            if (warned) {
++                for (String w : r.warnings()) System.err.println("warning: " + w);
++            }
++
++            if (!ok) {
++                System.err.println("packlint: REFUSED (" + r.errorCount() + " error(s)"
++                        + (warned ? ", " + r.warningCount() + " warning(s)" : "") + ")");
++                exit = 1;
++            } else if (strict && warned) {
++                System.err.println("packlint: --strict promoted " + r.warningCount()
++                        + " warning(s) to failure");
++                exit = 1;
++            } else {
++                System.out.println("packlint: OK" + (warned
++                        ? " with " + r.warningCount() + " warning(s)" : "")
++                        + (strict ? " (--strict)" : ""));
++                exit = 0;
++            }
++        } finally {
++            source.close();
++            if (nullDev != null) nullDev.close();
++        }
++        System.exit(exit);
++    }
++
++    private static void usage(PrintStream s) {
++        s.println("usage: packlint [--strict] [--null-device] <pack-dir-or-zip>");
++        s.println("  --strict       warnings become failures (exit 1)");
++        s.println("  --null-device  also validate required capabilities against the NULL device");
++        s.println("exit: 0 = loads, 1 = refused (or strict warnings), 2 = tool error");
++    }
++}
+-- 
+2.47.3
+

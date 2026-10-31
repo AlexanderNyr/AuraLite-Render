@@ -1,0 +1,29 @@
+{
+  "schemaVersion": 1,
+  "id": "auralite_render",
+  "version": "${version}",
+  "name": "AuraLite-Render",
+  "description": "AuraLite-Render glue: window swapchain, frame pacing, pack hot-reload, RenderDoc-friendly labelling.",
+  "authors": [
+    "AlexanderNyr"
+  ],
+  "contact": {
+    "sources": "https://github.com/AlexanderNyr/AuraLite-Render"
+  },
+  "license": "Apache-2.0",
+  "environment": "client",
+  "entrypoints": {
+    "client": [
+      "dev.auralite.render.fabric.AuraLiteRenderMod"
+    ]
+  },
+  "mixins": [
+    "auralite-render.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": ">=1.21",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}

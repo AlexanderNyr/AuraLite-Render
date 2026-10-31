@@ -50,11 +50,11 @@ Three layers, bottom up:
 
 | Gate | Command | Bar |
 |---|---|---|
-| Host | `make test` | 967/0, 7/7 green, OpenJDK 11, no GPU |
+| Host | `make test` | 1008/0, 8/8 green, OpenJDK 11 and 21 both measured, no GPU |
 | Perf | `make bench` | graph + biome + uniform gates, 5×, no timing in receipts |
 | Lint | `packlint` | exit non-zero on error, `--strict` promotes warnings |
 | Drift | `drift-check` | suite numbers may not move without their doc lines |
-| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps |
+| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps — software host now GREEN: vk + gl RENDERED (44 commands / 13 barriers / 6 passes each, exit 0; GL through zink with `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink`); hashes, validation-clean, timestamps and a discrete card still owed |
 | Parity | legacy suite | AuraLite-Shaders pixels match the reference loader |
 
 ## What is deliberately not in the plan

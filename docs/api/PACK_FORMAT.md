@@ -146,6 +146,37 @@ NATIVE never infers filenames: every stage is listed. A raster program
 without a vertex stage is a load error; a missing fragment stage is a
 warning, because depth-only shadow passes are legal and common.
 
+### Descriptors and draws
+
+An image uniform written as
+`layout(set = N, binding = B[, format]) uniform [readonly|writeonly] <image…|sampler…> <name>;`
+binds to the graph resource whose name equals `<name>` **exactly** — that
+equality is the whole mapping table. The pass must read or write that
+resource, `PackProgram.layout()` turns the declarations into the pipeline
+layout, and the pass body binds one descriptor set per set index right after
+the pipeline. Block uniforms (`uniform Block { … }`) are not parsed yet, and
+combined samplers are parsed but not yet wired in the graph — both refuse by
+name if a pack leans on them.
+
+A resource a compute pass writes (or reads) through a storage image must
+declare `usage=storage` in `[resources]` — the backend refuses the bind by
+name otherwise, and depth textures are never storage images: they are read
+as samples, and the sampler side of this contract lands with the graph's
+sampler bridge (until then a pack may keep the pass-level `read=` ordering
+edge and have its shader sample nothing).
+
+The pack dialect is Vulkan GLSL and the backends translate at compile time:
+the GL backend packs `set = S, binding = B` into GL's flat
+`binding = S*16 + binding` (the unit map in api/RHI.md) and renames
+`gl_VertexIndex` to `gl_VertexID`; SPIR-V is compiled from the dialect as
+written.
+
+Every raster body draws exactly one fullscreen triangle (`draw(3)`): the
+shaders carry the `gl_VertexIndex` convention (the reference pack's
+`final.vert` builds the entire quad from it). Stages that declare vertex
+inputs read the standard unbound-attribute constant — GL defines it, Vulkan
+asks for `VK_EXT_vertex_attribute_robustness` to define it too.
+
 ### [screen]
 
 Tabs, one per line: `Atmosphere = CLOUD_QUALITY`. The left side is the tab

@@ -1,0 +1,11 @@
+#version 460
+// Reference pack: half-resolution SSAO; dispatch ceil(width/16) x ceil(height/16).
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+// Reading scene_depth needs a sampler (depth textures are sampled, never
+// storage images); the graph's sampler bindings are not wired yet, so this
+// stub samples nothing - the pass keeps read=scene_depth for pass ordering.
+layout(set = 0, binding = 0, r16f) uniform writeonly image2D ao;
+void main() {
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    imageStore(ao, p, vec4(1.0));
+}

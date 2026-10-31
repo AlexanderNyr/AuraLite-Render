@@ -1,0 +1,421 @@
+From 8bdc7f9a9f325f685a5887ca4561e876414e29d1 Mon Sep 17 00:00:00 2001
+From: AlexanderNyr <131390634+AlexanderNyr@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 09:52:15 +0000
+Subject: [PATCH] Phase 3 - AuraLite-Native reference pack: the format's
+ executable spec
+
+packs/AuraLite-Native covers every grammar feature of pack.aurapack API
+level 1 once: 8 sections, raster + compute + history + external passes,
+bool/select/slider/const options, screen tabs, explicit stages. Gate:
+packlint 0 errors / 0 warnings (also --strict --null-device); the pack
+suite loads it from disk and executes its own frame on the NULL device
+via a pack-backed provider - 38 commands, 13 barriers, 40560 work groups,
+0 contract violations, shipped GLSL validated. Host gate: 985/0, 7/7.
+---
+ README.md                                     |  6 +-
+ docs/ROADMAP.md                               | 10 ++-
+ docs/STATUS.md                                | 13 +++-
+ docs/plans/BIG_PLAN.md                        |  2 +-
+ packs/AuraLite-Native/pack.aurapack           | 57 ++++++++++++++
+ .../AuraLite-Native/shaders/biome_field.comp  |  8 ++
+ packs/AuraLite-Native/shaders/final.frag      |  5 ++
+ packs/AuraLite-Native/shaders/final.vert      |  7 ++
+ packs/AuraLite-Native/shaders/shadow.frag     |  4 +
+ packs/AuraLite-Native/shaders/shadow.vert     |  4 +
+ packs/AuraLite-Native/shaders/ssao.comp       |  9 +++
+ packs/AuraLite-Native/shaders/taa.frag        |  5 ++
+ packs/AuraLite-Native/shaders/taa.vert        |  7 ++
+ packs/AuraLite-Native/shaders/terrain.frag    |  5 ++
+ packs/AuraLite-Native/shaders/terrain.vert    |  5 ++
+ .../dev/auralite/render/tests/PackSuite.java  | 78 +++++++++++++++++++
+ 16 files changed, 216 insertions(+), 9 deletions(-)
+ create mode 100644 packs/AuraLite-Native/pack.aurapack
+ create mode 100644 packs/AuraLite-Native/shaders/biome_field.comp
+ create mode 100644 packs/AuraLite-Native/shaders/final.frag
+ create mode 100644 packs/AuraLite-Native/shaders/final.vert
+ create mode 100644 packs/AuraLite-Native/shaders/shadow.frag
+ create mode 100644 packs/AuraLite-Native/shaders/shadow.vert
+ create mode 100644 packs/AuraLite-Native/shaders/ssao.comp
+ create mode 100644 packs/AuraLite-Native/shaders/taa.frag
+ create mode 100644 packs/AuraLite-Native/shaders/taa.vert
+ create mode 100644 packs/AuraLite-Native/shaders/terrain.frag
+ create mode 100644 packs/AuraLite-Native/shaders/terrain.vert
+
+diff --git a/README.md b/README.md
+index e35f2fc..d4e3e69 100644
+--- a/README.md
++++ b/README.md
+@@ -40,8 +40,10 @@ Host rule: everything except `fabric/` stays Java 11 source-compatible, so
+ `make test` is genuinely green on OpenJDK 11. `fabric/` is the documented
+ exception — it needs a JDK 21 lane this sandbox does not have.
+ 
+-Current state: **967 passed, 0 failed, 2 negative controls, 7/7 suites green**,
+-both backends compile `rc=0` against real LWJGL sources.
++Current state: **985 passed, 0 failed, 2 negative controls, 7/7 suites green**,
++both backends compile `rc=0` against real LWJGL sources, and the reference
++pack `packs/AuraLite-Native` lints clean and runs a NULL frame with 0
++violations.
+ 
+ ## The two modes
+ 
+diff --git a/docs/ROADMAP.md b/docs/ROADMAP.md
+index baadf23..aecef2a 100644
+--- a/docs/ROADMAP.md
++++ b/docs/ROADMAP.md
+@@ -32,13 +32,19 @@ byte-identically).
+   and exit 1; a warnings-only probe exits 0 and fails `--strict`; a legacy
+   probe reports coverage; drift-check passes clean and names a deliberately
+   moved count in its negative control.
++Closing patch: `patches/phase-2-docs-and-tools.patch` — replayed gate
++967/0, 7/7 plus `drift-check` PASS and the `packlint` probe receipts.
+ 
+-## Phase 3 — AuraLite-Native pack
++## Phase 3 — AuraLite-Native pack (closed)
+ 
+ The reference native pack under `packs/AuraLite-Native/`: resources, graph,
+ shaders, options, screen tabs. Small on purpose — it is the format's
+ executable spec, not a showcase. Gate: loads with 0 errors, executes 0
+-violations on NULL, lints clean.
++violations on NULL, lints clean. Receipt: packlint reports 0 errors and
++0 warnings (also under `--strict --null-device`); the pack suite loads it
++from disk and executes its own frame on the recording device — 38 commands,
++13 barriers, 40560 work groups, 0 contract violations, with the pack's
++shipped GLSL as the validated sources. Host gate moves to 985/0.
+ 
+ ## Phase 4 — fabric glue
+ 
+diff --git a/docs/STATUS.md b/docs/STATUS.md
+index 59a7014..a181df4 100644
+--- a/docs/STATUS.md
++++ b/docs/STATUS.md
+@@ -11,9 +11,9 @@ graph       81 passed   0 failed   1 NC   PASS
+ uniform     91 passed   0 failed   0 NC   PASS
+ biome      142 passed   0 failed   1 NC   PASS
+ nulldev    115 passed   0 failed   0 NC   PASS
+-pack       147 passed   0 failed   0 NC   PASS
++pack       165 passed   0 failed   0 NC   PASS
+ tables     340 passed   0 failed   0 NC   PASS
+-TOTAL 967 passed, 0 failed, 2 negative controls, 7/7 suites green
++TOTAL 985 passed, 0 failed, 2 negative controls, 7/7 suites green
+ RESULT: PASS
+ ```
+ 
+@@ -39,6 +39,9 @@ RESULT: PASS
+   8160 work groups, 0 violations. Legacy pack: 6 programs, 7 options, coverage
+   6/40; legacy frame 5 passes, 35 commands, 8 barriers, 0 violations.
+   `ceil(1080/16) = 68` — the dispatch covers every edge pixel.
++  The reference pack (`packs/AuraLite-Native`) loads 0 errors / 0 warnings
++  and its own frame runs on NULL with 38 commands, 13 barriers,
++  40560 work groups, 0 violations — its shipped GLSL is what gets validated.
+ - **tables**: GL maps 39/42 formats (no sized sRGB R/RG storage in core GL),
+   VK 41 + `UNDEFINED`→0; every enum literal verified against the spec value
+   (`RGBA8=0x8058`, `BC1_SRGB=0x8C4C`, `RGBA8_SRGB=43`, `D32S8=130`,
+@@ -53,6 +56,8 @@ packlint    valid native pack: OK, exit 0 (capabilities checked via --null-devic
+             broken pack: 4 named errors with file:line, REFUSED, exit 1
+             warnings-only pack: exit 0; with --strict: exit 1
+             legacy pack: OK, coverage 2/40, exit 0
++            reference pack (packs/AuraLite-Native): OK --strict --null-device,
++            0 errors, 0 warnings
+ drift-check 7 suite receipts + TOTAL match docs/STATUS.md and README.md, RESULT: PASS
+             negative control: one graph count moved in a copy of STATUS.md ->
+             named DRIFT line, exit 1
+@@ -69,9 +74,9 @@ drift-check 7 suite receipts + TOTAL match docs/STATUS.md and README.md, RESULT:
+ | backend-vulkan (VK 1.3, LWJGL, compile-verified) | done, compiles rc=0 |
+ | docs (README, ROADMAP, api/, plans/) | done — api/ has RHI, PACK_FORMAT, GRAPH, UNIFORMS, BIOME |
+ | tools (packlint, drift-check) | done, gated — see Tool gates |
+-| packs/AuraLite-Native | after tools |
++| packs/AuraLite-Native | done, gated — 0 errors, 0 warnings, NULL frame 0 violations |
+ | fabric/ (Java 21 + Gradle/Loom) | source + json only; build lane SKIPs (needs JDK 21) |
+-| patches/ (one .patch per phase) | done — `patches/phase-0-core-null.patch` (627/0, 6/6), `patches/phase-1-gl-vulkan-compile-verified.patch` (967/0, 7/7), both replay-verified |
++| patches/ (one .patch per phase) | done — `patches/phase-0-core-null.patch` (627/0, 6/6), `patches/phase-1-gl-vulkan-compile-verified.patch` (967/0, 7/7), `patches/phase-2-docs-and-tools.patch` (967/0 + tool gates), all replay-verified |
+ 
+ ## Backends (compile-verified, no GPU in this sandbox)
+ 
+diff --git a/docs/plans/BIG_PLAN.md b/docs/plans/BIG_PLAN.md
+index 7917128..47b6fc3 100644
+--- a/docs/plans/BIG_PLAN.md
++++ b/docs/plans/BIG_PLAN.md
+@@ -50,7 +50,7 @@ Three layers, bottom up:
+ 
+ | Gate | Command | Bar |
+ |---|---|---|
+-| Host | `make test` | 967/0, 7/7 green, OpenJDK 11, no GPU |
++| Host | `make test` | 985/0, 7/7 green, OpenJDK 11, no GPU |
+ | Perf | `make bench` | graph + biome + uniform gates, 5×, no timing in receipts |
+ | Lint | `packlint` | exit non-zero on error, `--strict` promotes warnings |
+ | Drift | `drift-check` | suite numbers may not move without their doc lines |
+diff --git a/packs/AuraLite-Native/pack.aurapack b/packs/AuraLite-Native/pack.aurapack
+new file mode 100644
+index 0000000..29e3142
+--- /dev/null
++++ b/packs/AuraLite-Native/pack.aurapack
+@@ -0,0 +1,57 @@
++# AuraLite-Native reference pack.
++#
++# The pack format's executable spec: one of every grammar feature from
++# docs/api/PACK_FORMAT.md, nothing more. Small on purpose - it is not a
++# showcase. Pinned by the pack suite: loads with 0 errors and 0 warnings,
++# executes a frame on the NULL device with 0 contract violations.
++
++[meta]
++name = AuraLite Native Reference
++version = 1.0.0
++author = AuraLite-Render
++description = Executable specification of pack.aurapack API level 1
++auralite.api = 1
++
++[capabilities]
++require = COMPUTE_SHADERS, TEXTURE_3D
++optional = RAY_QUERY
++
++[biome]
++spatialUniforms = true
++sampleEntries = 4
++
++[resources]
++scene_color  = rgba16f fullscreen
++scene_depth  = d32_sfloat fullscreen usage=depth
++ao           = r16f scaled=0.5
++taa          = rgba16f fullscreen history
++backbuffer   = rgba8_unorm fullscreen imported usage=color|present
++biome_volume = rgba8_uint biome-volume 3d usage=sampled
++
++[options]
++CLOUD_QUALITY = select "Raymarch steps" { 14=Cheap, 24=Standard, 36=High } default=24 tab=Atmosphere
++SSAO = bool "Screen-space ambient occlusion" default=true tab=Lighting
++BLOOM_STRENGTH = slider 0.0..2.0 step 0.05 "Bloom" default=0.35 tab=Colour
++DEBUG_VIEW = const "Debug view" default=0 tab=Lighting
++
++[graph]
++pass shadow_map raster depth=scene_depth program=shadow
++pass terrain raster color=scene_color depth=scene_depth read=biome_volume program=terrain
++pass biome_field compute write=biome_volume program=biome_field dispatch=ceil(width/8),ceil(height/8),1
++pass ssao compute write=ao read=scene_depth program=ssao dispatch=ceil(width/16),ceil(height/16),1 when=SSAO
++pass taa_resolve raster read=scene_color,ao,taa.prev color=taa.cur program=taa
++pass present raster read=taa.cur color=backbuffer external program=final
++present = taa
++
++[programs]
++shadow      = shaders/shadow.vert, shaders/shadow.frag
++terrain     = shaders/terrain.vert, shaders/terrain.frag
++biome_field = shaders/biome_field.comp local_size=8x8x1
++ssao        = shaders/ssao.comp local_size=16x16x1
++taa         = shaders/taa.vert, shaders/taa.frag
++final       = shaders/final.vert, shaders/final.frag
++
++[screen]
++Atmosphere = CLOUD_QUALITY
++Lighting = SSAO DEBUG_VIEW
++Colour = BLOOM_STRENGTH
+diff --git a/packs/AuraLite-Native/shaders/biome_field.comp b/packs/AuraLite-Native/shaders/biome_field.comp
+new file mode 100644
+index 0000000..fb2f0ae
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/biome_field.comp
+@@ -0,0 +1,8 @@
++#version 460
++// Reference pack: compute pass that fills the baked biome volume.
++layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
++layout(set = 0, binding = 0, rgba8ui) uniform writeonly uimage3D biomeVolume;
++void main() {
++    uvec3 p = gl_GlobalInvocationID;
++    imageStore(biomeVolume, ivec3(p), uvec4(1u, 0u, 0u, 255u));
++}
+diff --git a/packs/AuraLite-Native/shaders/final.frag b/packs/AuraLite-Native/shaders/final.frag
+new file mode 100644
+index 0000000..a61371d
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/final.frag
+@@ -0,0 +1,5 @@
++#version 460
++// Reference pack: present pass, fragment stage; writes the imported backbuffer.
++layout(location = 0) in vec2 vUv;
++layout(location = 0) out vec4 outColor;
++void main() { outColor = vec4(vUv, 0.0, 1.0); }
+diff --git a/packs/AuraLite-Native/shaders/final.vert b/packs/AuraLite-Native/shaders/final.vert
+new file mode 100644
+index 0000000..5f9fc0b
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/final.vert
+@@ -0,0 +1,7 @@
++#version 460
++// Reference pack: present pass, vertex stage.
++layout(location = 0) out vec2 vUv;
++void main() {
++    vUv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++    gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/packs/AuraLite-Native/shaders/shadow.frag b/packs/AuraLite-Native/shaders/shadow.frag
+new file mode 100644
+index 0000000..f335351
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/shadow.frag
+@@ -0,0 +1,4 @@
++#version 460
++// Reference pack: shadow pass fragment stage (present so the program lints clean).
++layout(location = 0) out float shadowDepth;
++void main() { shadowDepth = gl_FragCoord.z; }
+diff --git a/packs/AuraLite-Native/shaders/shadow.vert b/packs/AuraLite-Native/shaders/shadow.vert
+new file mode 100644
+index 0000000..550fdbe
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/shadow.vert
+@@ -0,0 +1,4 @@
++#version 460
++// Reference pack: depth-only shadow pass, vertex stage.
++layout(location = 0) in vec3 inPos;
++void main() { gl_Position = vec4(inPos, 1.0); }
+diff --git a/packs/AuraLite-Native/shaders/ssao.comp b/packs/AuraLite-Native/shaders/ssao.comp
+new file mode 100644
+index 0000000..2ce630e
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/ssao.comp
+@@ -0,0 +1,9 @@
++#version 460
++// Reference pack: half-resolution SSAO; dispatch ceil(width/16) x ceil(height/16).
++layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
++layout(set = 0, binding = 0, r16f) uniform readonly image2D sceneDepth;
++layout(set = 0, binding = 1, r16f) uniform writeonly image2D aoImage;
++void main() {
++    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
++    imageStore(aoImage, p, vec4(1.0));
++}
+diff --git a/packs/AuraLite-Native/shaders/taa.frag b/packs/AuraLite-Native/shaders/taa.frag
+new file mode 100644
+index 0000000..0ffbdba
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/taa.frag
+@@ -0,0 +1,5 @@
++#version 460
++// Reference pack: TAA resolve reads scene_color, ao and the previous history side.
++layout(location = 0) in vec2 vUv;
++layout(location = 0) out vec4 outColor;
++void main() { outColor = vec4(vUv, 0.0, 1.0); }
+diff --git a/packs/AuraLite-Native/shaders/taa.vert b/packs/AuraLite-Native/shaders/taa.vert
+new file mode 100644
+index 0000000..6af84cb
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/taa.vert
+@@ -0,0 +1,7 @@
++#version 460
++// Reference pack: fullscreen triangle for the TAA resolve.
++layout(location = 0) out vec2 vUv;
++void main() {
++    vUv = vec2((gl_VertexIndex << 1) & 2, gl_VertexIndex & 2);
++    gl_Position = vec4(vUv * 2.0 - 1.0, 0.0, 1.0);
++}
+diff --git a/packs/AuraLite-Native/shaders/terrain.frag b/packs/AuraLite-Native/shaders/terrain.frag
+new file mode 100644
+index 0000000..ea97ac9
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/terrain.frag
+@@ -0,0 +1,5 @@
++#version 460
++// Reference pack: terrain fragment stage; writes the HDR scene colour.
++layout(location = 0) in vec3 vWorld;
++layout(location = 0) out vec4 outColor;
++void main() { outColor = vec4(vWorld, 1.0); }
+diff --git a/packs/AuraLite-Native/shaders/terrain.vert b/packs/AuraLite-Native/shaders/terrain.vert
+new file mode 100644
+index 0000000..2546038
+--- /dev/null
++++ b/packs/AuraLite-Native/shaders/terrain.vert
+@@ -0,0 +1,5 @@
++#version 460
++// Reference pack: terrain vertex stage; the real pack samples biome_volume here.
++layout(location = 0) in vec3 inPos;
++layout(location = 0) out vec3 vWorld;
++void main() { vWorld = inPos; gl_Position = vec4(inPos, 1.0); }
+diff --git a/tests/src/dev/auralite/render/tests/PackSuite.java b/tests/src/dev/auralite/render/tests/PackSuite.java
+index 231bdee..3ffa737 100644
+--- a/tests/src/dev/auralite/render/tests/PackSuite.java
++++ b/tests/src/dev/auralite/render/tests/PackSuite.java
+@@ -479,7 +479,85 @@ public final class PackSuite {
+         contains(bothLoader.report().notes().toString(), "legacy tree was ignored",
+                 "and that the other was ignored");
+ 
++        section("reference pack: packs/AuraLite-Native is the executable spec");
++        java.nio.file.Path refDir = java.nio.file.Paths.get("packs/AuraLite-Native");
++        check(java.nio.file.Files.isRegularFile(refDir.resolve("pack.aurapack")),
++                "packs/AuraLite-Native/pack.aurapack exists (run make test from the repository root)");
++        PackLoader rl = new PackLoader(new PackSource.Directory(refDir));
++        check(rl.load(null), "the reference pack loads with 0 errors: " + rl.report().errors());
++        PackManifest rm = rl.manifest();
++        eq(rl.report().errorCount(), 0, "0 errors");
++        eq(rl.report().warningCount(), 0, "0 warnings - it lints clean: " + rl.report().warnings());
++        eq(rm.format, PackFormat.NATIVE, "detected NATIVE");
++        eq(rm.apiLevel, 1, "api level 1");
++        check(rm.requiredCapabilities.contains(GfxCapability.COMPUTE_SHADERS),
++                "the compute requirement survived validation");
++        check(rm.spatialBiomeUniforms, "spatial biome uniforms are on");
++        eq(rm.graph.passes().size(), 6, "6 passes cover raster, compute, history and external");
++        eq(rm.optionCount(), 4, "4 options cover bool, select, slider and const");
++        eq(rm.programCount(), 6, "6 programs, every stage listed explicitly");
++        eq(rm.graph.presentResource, "taa", "the present resource is declared");
++
++        // The provider answers only with the pack's own declared programs and
++        // sources, so the NULL device structurally validates the shipped GLSL
++        // (entry point per stage) as part of this gate.
++        NullDevice rdev = new NullDevice();
++        PackGraphBuilder rb = new PackGraphBuilder(rm, packBackedProvider(rdev, rm));
++        RenderGraph rg = rb.build(1920, 1080, rm.shadowMapResolution(), new int[] { 23, 97, 23 });
++        CompiledGraph rc = rg.compile(1920, 1080, rdev.limits());
++        List<String> rorder = rc.passOrder();
++        eq(rorder.get(rorder.size() - 1), "present", "present is last");
++        check(rorder.contains("biome_field"), "the compute pass survives culling (terrain reads its output)");
++        check(rorder.contains("ssao"), "the option-gated compute pass runs with SSAO on by default");
++        rc.allocate(rdev);
++        rc.bindImported("backbuffer", rdev.createImage(GfxDesc.Image.tex2d(1920, 1080,
++                GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT)
++                .named("window")));
++        rdev.beginFrame();
++        RecordingCommandBuffer rcb = (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
++        rcb.begin();
++        rc.execute(new GraphContext(rdev, rcb, rc, new FrameContext()));
++        rcb.end();
++        rdev.submit(QueueType.GRAPHICS, rcb);
++        rdev.endFrame();
++        eq(rdev.violations().size(), 0,
++                "the reference frame ran with 0 contract violations: " + rdev.violations());
++        eq(rcb.count(RecordingCommandBuffer.Op.BIND_COMPUTE), 2, "both compute pipelines were bound");
++        check(rcb.workGroupsDispatched() > 0, "the compute dispatches used the resolved extents");
++        receipt("reference pack: loads 0 errors 0 warnings, frame " + rcb.commandCount() + " commands, "
++                + rc.totalBarriers() + " barriers, " + rcb.workGroupsDispatched() + " work groups, 0 violations");
++        rc.release();
++        rdev.close();
++
+         ndev.close();
+         ldev.close();
+     }
++
++    /**
++     * A provider that answers only with the pack's own declared programs and
++     * shader sources - the reference-pack gate uses it so the shipped GLSL is
++     * what the NULL device validates, not a stub.
++     */
++    static PipelineProvider packBackedProvider(final NullDevice d, final PackManifest m) {
++        return new PipelineProvider() {
++            @Override public GfxPipeline rasterPipeline(String name, GfxDesc.RenderPass pass) {
++                PackProgram p = m.program(name);
++                GfxDesc.GraphicsPipeline gp = new GfxDesc.GraphicsPipeline().named(name);
++                if (p.stage(GfxStage.VERTEX) != null) gp.stage(d.createShaderModule(p.stage(GfxStage.VERTEX)));
++                if (p.stage(GfxStage.FRAGMENT) != null) gp.stage(d.createShaderModule(p.stage(GfxStage.FRAGMENT)));
++                return d.createGraphicsPipeline(gp);
++            }
++            @Override public GfxPipeline computePipeline(String name) {
++                PackProgram p = m.program(name);
++                if (p == null || p.stage(GfxStage.COMPUTE) == null) return null;
++                return d.createComputePipeline(GfxDesc.ComputePipeline
++                        .of(d.createShaderModule(p.stage(GfxStage.COMPUTE)))
++                        .localSize(p.localSizeX, p.localSizeY, p.localSizeZ).named(name));
++            }
++            @Override public boolean has(String name) {
++                PackProgram p = m.program(name);
++                return p != null && p.stageCount() > 0;
++            }
++        };
++    }
+ }
+-- 
+2.47.3
+

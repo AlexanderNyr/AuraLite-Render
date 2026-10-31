@@ -881,6 +881,35 @@ public final class GlDevice implements GfxDevice {
         final String infoLog;
         private boolean closed;
 
+        /**
+         * The pack dialect writes Vulkan descriptor sets ({@code layout(set =
+         * N, binding = B)}); GL's namespace is flat and our bridge binds a
+         * write at {@code unit = set * SET_STRIDE + binding} (RHI.md), so the
+         * GLSL handed to GL gets the same packing at compile time. GL-only:
+         * the SPIR-V path keeps its sets for the driver to consume. The same
+         * pass renames {@code gl_VertexIndex} onto GL's {@code gl_VertexID} -
+         * both sides of one fullscreen-triangle convention.
+         */
+        static String packDescriptorSets(String glsl) {
+            // The pack's fullscreen-triangle convention spells Vulkan's
+            // gl_VertexIndex; GL's builtin of the same meaning is gl_VertexID.
+            // Applies even to shaders with no image declarations.
+            glsl = glsl.replaceAll("\\bgl_VertexIndex\\b", "gl_VertexID");
+            java.util.regex.Matcher m = java.util.regex.Pattern
+                    .compile("layout\\s*\\(\\s*set\\s*=\\s*(\\d+)\\s*,\\s*binding\\s*=\\s*(\\d+)")
+                    .matcher(glsl);
+            if (!m.find()) return glsl;
+            StringBuffer out = new StringBuffer(glsl.length());
+            do {
+                int set = Integer.parseInt(m.group(1));
+                int binding = Integer.parseInt(m.group(2));
+                m.appendReplacement(out,
+                        "layout(binding = " + (set * GlCommandBuffer.SET_STRIDE + binding));
+            } while (m.find());
+            m.appendTail(out);
+            return out.toString();
+        }
+
         GlShaderModule(GlDevice device, ShaderSource source) {
             this.device = device;
             this.stage = source.stage();
@@ -892,7 +921,7 @@ public final class GlDevice implements GfxDevice {
                 this.valid = specialize(source);
                 this.infoLog = valid ? "" : device.lastError();
             } else {
-                glShaderSource(name, source.preprocessed());
+                glShaderSource(name, packDescriptorSets(source.preprocessed()));
                 org.lwjgl.opengl.GL46C.glCompileShader(name);
                 this.valid = glGetShaderi(name, org.lwjgl.opengl.GL46C.GL_COMPILE_STATUS)
                         == org.lwjgl.opengl.GL46C.GL_TRUE;

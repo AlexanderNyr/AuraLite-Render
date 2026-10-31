@@ -1,0 +1,12 @@
+// AuraLite-Render fabric glue (ROADMAP Phase 4).
+// Built only where a JDK 21 exists; the host `make build` SKIPs this module
+// by design and gates its static facts with the fabric suite instead.
+pluginManagement {
+    repositories {
+        maven { url = 'https://maven.fabricmc.net/' }
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+rootProject.name = 'auralite-render-fabric'

@@ -5,6 +5,13 @@ build/
 # Fetched by `make deps` (LWJGL 3.4.3 jars + natives, ~11 MB). Compile-only; never committed.
 third_party/
 
+# Gradle/Loom caches (fabric/ lane; rebuilt by gradle build, never committed).
+.gradle/
+
+# JVM crash reports from gpu-test lanes (the finding is the receipt, the file
+# is a reproducible artifact).
+hs_err_pid*.log
+
 # Editor and OS noise.
 .idea/
 *.iml

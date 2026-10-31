@@ -1,0 +1,12 @@
+{
+  "required": true,
+  "package": "dev.auralite.render.fabric.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "client": [
+    "GameRendererMixin"
+  ],
+  "injectors": {
+    "defaultRequire": 1
+  },
+  "mixins": []
+}

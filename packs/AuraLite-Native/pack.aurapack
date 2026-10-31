@@ -1,0 +1,57 @@
+# AuraLite-Native reference pack.
+#
+# The pack format's executable spec: one of every grammar feature from
+# docs/api/PACK_FORMAT.md, nothing more. Small on purpose - it is not a
+# showcase. Pinned by the pack suite: loads with 0 errors and 0 warnings,
+# executes a frame on the NULL device with 0 contract violations.
+
+[meta]
+name = AuraLite Native Reference
+version = 1.0.0
+author = AuraLite-Render
+description = Executable specification of pack.aurapack API level 1
+auralite.api = 1
+
+[capabilities]
+require = COMPUTE_SHADERS, TEXTURE_3D
+optional = RAY_QUERY
+
+[biome]
+spatialUniforms = true
+sampleEntries = 4
+
+[resources]
+scene_color  = rgba16f fullscreen
+scene_depth  = d32_sfloat fullscreen usage=depth
+ao           = r16f scaled=0.5 usage=storage|sampled
+taa          = rgba16f fullscreen history
+backbuffer   = rgba8_unorm fullscreen imported usage=color|present
+biome_volume = rgba8_uint biome-volume 3d usage=sampled|storage
+
+[options]
+CLOUD_QUALITY = select "Raymarch steps" { 14=Cheap, 24=Standard, 36=High } default=24 tab=Atmosphere
+SSAO = bool "Screen-space ambient occlusion" default=true tab=Lighting
+BLOOM_STRENGTH = slider 0.0..2.0 step 0.05 "Bloom" default=0.35 tab=Colour
+DEBUG_VIEW = const "Debug view" default=0 tab=Lighting
+
+[graph]
+pass shadow_map raster depth=scene_depth program=shadow
+pass terrain raster color=scene_color depth=scene_depth read=biome_volume program=terrain
+pass biome_field compute write=biome_volume program=biome_field dispatch=ceil(width/8),ceil(height/8),1
+pass ssao compute write=ao read=scene_depth program=ssao dispatch=ceil(width/16),ceil(height/16),1 when=SSAO
+pass taa_resolve raster read=scene_color,ao,taa.prev color=taa.cur program=taa
+pass present raster read=taa.cur color=backbuffer external program=final
+present = taa
+
+[programs]
+shadow      = shaders/shadow.vert, shaders/shadow.frag
+terrain     = shaders/terrain.vert, shaders/terrain.frag
+biome_field = shaders/biome_field.comp local_size=8x8x1
+ssao        = shaders/ssao.comp local_size=16x16x1
+taa         = shaders/taa.vert, shaders/taa.frag
+final       = shaders/final.vert, shaders/final.frag
+
+[screen]
+Atmosphere = CLOUD_QUALITY
+Lighting = SSAO DEBUG_VIEW
+Colour = BLOOM_STRENGTH

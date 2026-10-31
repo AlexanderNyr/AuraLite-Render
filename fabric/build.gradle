@@ -1,0 +1,94 @@
+// AuraLite-Render fabric glue: window swapchain, frame pacing, pack
+// hot-reload, RenderDoc-friendly labelling (ROADMAP Phase 4).
+//
+// IMPORTANT - what this file is and is not:
+//  * It is the ONLY build lane that needs a JDK 21 (the host build stays
+//    Java 11 and prints "fabric: SKIP" on purpose).
+//  * Nothing here is claimed green until `./gradlew build` runs on a JDK 21
+//    lane AND a windowed frame has been presented on a real GPU
+//    (ROADMAP Phase 4 + 5 gates). Standing rule 4 applies.
+plugins {
+    id 'fabric-loom' version '1.10.5'
+    id 'maven-publish'
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base { archivesName = 'auralite-render-fabric' }
+
+java {
+    toolchain.languageVersion = JavaLanguageVersion.of(21)
+    withSourcesJar()
+}
+
+repositories {
+    mavenCentral()
+}
+
+// LWJGL 3.4.3 is a multi-release jar: META-INF/versions/27 ships class-file
+// major 71, which tiny-remapper's ASM refuses ("Unsupported class file major
+// version 71") while remapJar analyzes the compile classpath. The host javac
+// lane is happy with the raw jars; the loom lane gets stripped copies with
+// only the base (Java 8/11) classes - which is all this module compiles
+// against anyway.
+def lwjglStrippedDir = layout.buildDirectory.dir('lwjgl-stripped').get().asFile
+def strippedTasks = ['lwjgl', 'lwjgl-opengl', 'lwjgl-vulkan'].collect { base ->
+    def taskName = "strip-${base}"
+    tasks.register(taskName, Zip) {
+        from({ zipTree("../third_party/${base}.jar").matching { exclude 'META-INF/versions/**' } })
+        archiveFileName = "${base}-stripped.jar"
+        destinationDirectory = lwjglStrippedDir
+    }
+    taskName
+}
+def strippedLwjgl = ['lwjgl', 'lwjgl-opengl', 'lwjgl-vulkan'].collect {
+    new File(lwjglStrippedDir, "${it}-stripped.jar")
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Compile the renderer itself from this repository's own sources - no
+    // published artifacts, no Gradle in the host lane. LWJGL is compile-time
+    // only here; the game provides it at runtime (see gradle.properties).
+    // Stripped copies: see the multi-release note above.
+    compileOnly files(strippedLwjgl)
+}
+
+compileJava {
+    dependsOn strippedTasks
+}
+
+// Every consumer of the compile classpath (jar, remapJar, remapSourcesJar,
+// sourcesJar, ...) must wait for the stripped copies; declare it once.
+tasks.configureEach { t ->
+    if (!t.name.startsWith('strip-')) {
+        t.dependsOn strippedTasks
+    }
+}
+
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand 'version': project.version
+    }
+}
+
+compileJava {
+    // The core/backends stay Java 11 source-compatible; this module is the
+    // one documented exception and may use Java 21.
+    options.release = 21
+    options.compilerArgs += ['-Xlint:-options']
+    source fileTree('../core/src/main/java')
+    source fileTree('../backend-gl/src/main/java')
+    source fileTree('../backend-vulkan/src/main/java')
+    source fileTree('../backend-null/src/main/java')
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
