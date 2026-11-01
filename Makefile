@@ -7,7 +7,10 @@ JAVAC ?= javac
 JAVA ?= java
 
 LWJGL_VERSION = 3.4.3
-MAVEN = https://repo1.maven.org/maven2/org/lwjgl
+# Maven Central via the Aliyun mirror: repo1.maven.org resets connections
+# from some regions (curl error 35). To go back to Central directly:
+#   MAVEN = https://repo1.maven.org/maven2/org/lwjgl
+MAVEN = https://maven.aliyun.com/repository/central/org/lwjgl
 THIRD_PARTY = third_party
 LWJGL_JARS = $(THIRD_PARTY)/lwjgl.jar $(THIRD_PARTY)/lwjgl-opengl.jar $(THIRD_PARTY)/lwjgl-vulkan.jar \
     $(THIRD_PARTY)/lwjgl-egl.jar $(THIRD_PARTY)/lwjgl-natives-linux.jar \
