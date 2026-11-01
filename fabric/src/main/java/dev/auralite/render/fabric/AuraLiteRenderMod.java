@@ -2,6 +2,11 @@ package dev.auralite.render.fabric;
 
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientLifecycleEvents;
+import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+import net.minecraft.client.option.KeyBinding;
+import net.minecraft.client.util.InputUtil;
+import org.lwjgl.glfw.GLFW;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -29,5 +34,17 @@ public final class AuraLiteRenderMod implements ClientModInitializer {
         LOGGER.info("AuraLite-Render glue initializing (client); "
                 + "device creation is deferred to the first rendered frame");
         ClientLifecycleEvents.CLIENT_STOPPING.register(client -> RendererLoop.shutdown());
+
+        // Right Shift opens the status screen (state, retry, pack reload).
+        KeyBinding menu = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.auralite_render.menu", InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_RIGHT_SHIFT, "category.auralite_render"));
+        ClientTickEvents.END_CLIENT_TICK.register(client -> {
+            while (menu.wasPressed()) {
+                if (client.currentScreen == null) {
+                    client.setScreen(new AuraLiteHudScreen());
+                }
+            }
+        });
     }
 }

@@ -44,12 +44,14 @@ public final class RendererLoop {
     private static CompiledGraph graph;
     private static PackSource source;
     private static boolean failed;
+    private static String lastError;           // null while healthy; GUI + receipt
+    private static long frames;                // successful frames since process start
     private static long lastFrameNanos = -1L;
 
     private RendererLoop() { }
 
     /** Called from the render-thread frame hook with the current framebuffer size. */
-    public static void frame(long time, boolean tick, int fbWidth, int fbHeight) {
+    public static void frame(boolean tick, int fbWidth, int fbHeight) {
         if (failed) return;
         try {
             if (device == null) init(fbWidth, fbHeight);
@@ -76,10 +78,57 @@ public final class RendererLoop {
             device.submit(QueueType.GRAPHICS, cmd);
             device.endFrame();
             pacer.endFrame();
+            frames++;
         } catch (RuntimeException e) {
             failed = true;
+            lastError = e.toString();
             AuraLiteRenderMod.LOGGER.error("renderer loop failed; frames stop instead of "
                     + "spamming a broken device:", e);
+        }
+    }
+
+    /** One-line state for the in-game screen: RUNNING / FAILED / IDLE. */
+    public static String statusLine() {
+        if (failed) return "FAILED: " + (lastError != null ? lastError : "unknown error");
+        if (device == null) return "IDLE: waiting for the first rendered frame";
+        return "RUNNING: " + device.deviceName() + " | driver " + device.driverVersion();
+    }
+
+    /** Successful frames since process start (0 until the first one lands). */
+    public static long framesRendered() { return frames; }
+
+    /** Last loop failure as a single line, or null when healthy. */
+    public static String lastError() { return lastError; }
+
+    /** Arm a fresh device attempt on the next frame (screen button). */
+    public static void retry() {
+        if (device != null) {
+            try { device.waitIdle(); } catch (RuntimeException ignored) { }
+            if (graph != null) { graph.release(); graph = null; }
+            if (pipelines != null) { pipelines.invalidate(); pipelines = null; }
+            try { device.close(); } catch (RuntimeException ignored) { }
+            device = null;
+        }
+        swapchain = null;
+        pacer = null;
+        failed = false;
+        lastError = null;
+        AuraLiteRenderMod.LOGGER.info("renderer retry armed; the next frame re-creates the device");
+    }
+
+    /** Hot-reload from the screen button; refused by name when no device. */
+    public static void requestPackReload() {
+        if (failed || device == null) {
+            AuraLiteRenderMod.LOGGER.warn("pack reload requested with no live device; ignoring");
+            return;
+        }
+        try {
+            rebuild();
+            AuraLiteRenderMod.LOGGER.info("pack reload requested: done");
+        } catch (RuntimeException e) {
+            failed = true;
+            lastError = e.toString();
+            AuraLiteRenderMod.LOGGER.error("pack reload failed; frames stop:", e);
         }
     }
 
