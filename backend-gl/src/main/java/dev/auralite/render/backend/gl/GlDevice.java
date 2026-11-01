@@ -162,6 +162,7 @@ public final class GlDevice implements GfxDevice {
     private final int pushUbo;
     private final int[] timestampRing = new int[64];
     private int timestampCursor;
+    private final java.util.List<Integer> frameTimestampQueries = new java.util.ArrayList<Integer>();
     private final List<Integer> scratchQueries = new ArrayList<Integer>();
 
     private long frameId;
@@ -398,6 +399,32 @@ public final class GlDevice implements GfxDevice {
 
     // ------------------------------------------------------------- uploads ---
 
+    @Override public byte[] readImage(GfxImage image) {
+        if (!(image instanceof GlImage)) {
+            throw new GfxException("gl backend: readImage of a foreign image ("
+                    + image.getClass().getName() + ")");
+        }
+        if (((GlImage) image).name == 0) {
+            throw new GfxException("gl backend: readImage of the window-system framebuffer"
+                    + " (handle 0) - a surfaceless default framebuffer has no storage to"
+                    + " hash; bind an offscreen image instead");
+        }
+        GfxFormat f = image.format();
+        if (f != GfxFormat.RGBA8_UNORM && f != GfxFormat.RGBA8_SRGB) {
+            throw new GfxException("gl backend: readImage supports the RGBA8 family only, got "
+                    + f + " for image '" + image.desc().debugName + "'");
+        }
+        int w = image.width(), h = image.height();
+        int bytes = w * h * 4;
+        java.nio.ByteBuffer buf = org.lwjgl.BufferUtils.createByteBuffer(bytes);
+        org.lwjgl.opengl.GL46C.glGetTextureSubImage(((GlImage) image).name, 0, 0, 0, 0,
+                w, h, 1, org.lwjgl.opengl.GL46C.GL_RGBA,
+                org.lwjgl.opengl.GL46C.GL_UNSIGNED_BYTE, buf);
+        byte[] out = new byte[bytes];
+        buf.get(out);
+        return out;
+    }
+
     @Override public void uploadBuffer(GfxBuffer dst, ByteBuffer src, long dstOffsetBytes) {
         GlBuffer b = ownBuffer(dst);
         Checks.notNull(src, "src");
@@ -443,7 +470,10 @@ public final class GlDevice implements GfxDevice {
 
     // --------------------------------------------------------------- frame ---
 
-    @Override public long beginFrame() { return ++frameId; }
+    @Override public long beginFrame() {
+        frameTimestampQueries.clear();
+        return ++frameId;
+    }
 
     @Override public void submit(QueueType queue, GfxCommandBuffer cmd) {
         Checks.notNull(cmd, "cmd");
@@ -626,7 +656,21 @@ public final class GlDevice implements GfxDevice {
     int nextTimestampQuery() {
         int q = timestampRing[timestampCursor];
         timestampCursor = (timestampCursor + 1) % timestampRing.length;
+        frameTimestampQueries.add(q);
         return q;
+    }
+
+    @Override public long[] frameTimestamps() {
+        long[] ts = new long[frameTimestampQueries.size()];
+        java.nio.LongBuffer one = org.lwjgl.BufferUtils.createLongBuffer(1);
+        for (int i = 0; i < ts.length; i++) {
+            one.clear();
+            org.lwjgl.opengl.GL46C.glGetQueryObjectui64v(
+                    frameTimestampQueries.get(i).intValue(),
+                    org.lwjgl.opengl.GL46C.GL_QUERY_RESULT, one);
+            ts[i] = one.get(0);
+        }
+        return ts;
     }
 
     int pushUbo() { return pushUbo; }

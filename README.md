@@ -82,7 +82,8 @@ report instead of happening silently. Format authority:
    which call, and what was wrong.
 3. The NULL backend is the spec. If GL and VK disagree, the recording device
    settles it.
-4. The sandbox's software GPUs (lavapipe, llvmpipe, zink) do render - but a
-   frame is claimed only by the harness's own `RENDERED` receipt
-   (submit + waitIdle of the real command buffer), with pixel hashes and
-   validation-clean kept as their own separate gates in docs/STATUS.md.
+4. The sandbox's software GPUs (lavapipe, llvmpipe, zink) do render - and a
+   frame is claimed only by the harness's own `RENDERED` receipt: submit +
+   waitIdle of the real command buffer, then a non-zero mip-0 pixel sha256
+   and strictly-increasing GPU timestamps in the same line. Blank bytes are
+   refused; validation-clean stays its own gate in docs/STATUS.md.

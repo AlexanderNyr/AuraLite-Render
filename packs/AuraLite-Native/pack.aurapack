@@ -22,7 +22,7 @@ sampleEntries = 4
 
 [resources]
 scene_color  = rgba16f fullscreen
-scene_depth  = d32_sfloat fullscreen usage=depth
+scene_depth  = d32_sfloat fullscreen usage=depth|sampled
 ao           = r16f scaled=0.5 usage=storage|sampled
 taa          = rgba16f fullscreen history
 backbuffer   = rgba8_unorm fullscreen imported usage=color|present

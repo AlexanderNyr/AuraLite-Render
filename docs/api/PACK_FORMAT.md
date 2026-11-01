@@ -173,9 +173,10 @@ written.
 
 Every raster body draws exactly one fullscreen triangle (`draw(3)`): the
 shaders carry the `gl_VertexIndex` convention (the reference pack's
-`final.vert` builds the entire quad from it). Stages that declare vertex
-inputs read the standard unbound-attribute constant — GL defines it, Vulkan
-asks for `VK_EXT_vertex_attribute_robustness` to define it too.
+`final.vert` builds the entire quad from it). Until real mesh data lands,
+vertex stages declare no inputs and write their placeholder positions
+literally — the frame must not depend on `VK_EXT_vertex_attribute_robustness`
+(lavapipe cannot offer it, and a spec-defined constant is portable).
 
 ### [screen]
 

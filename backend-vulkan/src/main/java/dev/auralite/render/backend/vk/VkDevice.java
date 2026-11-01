@@ -198,6 +198,14 @@ public final class VkDevice implements GfxDevice {
     private int timestampIndex;
     private boolean hostQueryResetSupported;
 
+    /**
+     * VK_KHR_swapchain is never enabled on this device (presentation belongs
+     * to the Fabric glue, which owns the surface). Until that lands, the
+     * PRESENT resource state must translate to a legal stand-in layout -
+     * PRESENT_SRC_KHR without the extension is a validation violation.
+     */
+    boolean swapchainEnabled() { return false; }
+
     private long frameId;
     private long totalCreated;
     private String lastError = "";
@@ -750,6 +758,58 @@ public final class VkDevice implements GfxDevice {
 
     // ------------------------------------------------------------- uploads ---
 
+    @Override public byte[] readImage(GfxImage image) {
+        VkImage img = ownImage(image);
+        GfxFormat f = image.format();
+        if (f != GfxFormat.RGBA8_UNORM && f != GfxFormat.RGBA8_SRGB) {
+            throw new GfxException("vulkan backend: readImage supports the RGBA8 family only, got "
+                    + f + " for image '" + img.desc.debugName + "'");
+        }
+        if ((img.desc.usage & GfxUsage.IMAGE_TRANSFER_SRC) == 0) {
+            throw new GfxException("vulkan backend: readImage needs IMAGE_TRANSFER_SRC on image '"
+                    + img.desc.debugName + "' (" + GfxUsage.describe(img.desc.usage) + ")");
+        }
+        int w = img.desc.width, h = img.desc.height;
+        int bytes = w * h * 4;
+        VkBuffer staging = new VkBuffer(this, GfxDesc.Buffer.of(bytes, GfxUsage.BUFFER_TRANSFER_DST)
+                .domain(MemoryDomain.HOST_VISIBLE).named("readback"));
+        try {
+            runOneShot(new OneShot() {
+                @Override public void record(org.lwjgl.vulkan.VkCommandBuffer cmd) {
+                    int before = currentLayout(img.handle);
+                    transition(cmd, img, before, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            0, VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT);
+                    try (MemoryStack inner = MemoryStack.stackPush()) {
+                        VkBufferImageCopy.Buffer region = VkBufferImageCopy.calloc(1, inner);
+                        region.get(0).bufferOffset(0).bufferRowLength(0).bufferImageHeight(0);
+                        region.get(0).imageSubresource().aspectMask(img.aspect()).mipLevel(0)
+                                .baseArrayLayer(0).layerCount(img.desc.arrayLayers);
+                        region.get(0).imageOffset().set(0, 0, 0);
+                        region.get(0).imageExtent().set(w, h, 1);
+                        vkCmdCopyImageToBuffer(cmd, img.handle,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, staging.handle, region);
+                    }
+                    transition(cmd, img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, before,
+                            VK_ACCESS_TRANSFER_READ_BIT,
+                            VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+                            VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
+                    setLayout(img.handle, before);
+                }
+            });
+            // 1280x720x4 is far past MemoryStack's capacity - this buffer
+            // lives on the LWJGL heap, not the native stack.
+            ByteBuffer out = org.lwjgl.BufferUtils.createByteBuffer(bytes);
+            staging.readHost(0, out);
+            byte[] arr = new byte[bytes];
+            out.flip();
+            out.get(arr);
+            return arr;
+        } finally {
+            staging.destroy();
+        }
+    }
+
     @Override public void uploadBuffer(GfxBuffer dst, ByteBuffer src, long dstOffsetBytes) {
         VkBuffer d = ownBuffer(dst);
         Checks.notNull(src, "src");
@@ -978,6 +1038,21 @@ public final class VkDevice implements GfxDevice {
     @Override public int livePipelineCount() { return livePipelines.size(); }
     @Override public int liveShaderModuleCount() { return liveModules.size(); }
     @Override public String lastError() { return lastError; }
+    @Override public long[] frameTimestamps() {
+        int count = timestampIndex;
+        if (count == 0) return new long[0];
+        try (MemoryStack stack = MemoryStack.stackPush()) {
+            LongBuffer out = stack.mallocLong(count);
+            check(vkGetQueryPoolResults(device, timestampPool, 0, count,
+                    out, Long.BYTES,
+                    VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT),
+                    "vkGetQueryPoolResults(timestamps)");
+            long[] ts = new long[count];
+            for (int i = 0; i < count; i++) ts[i] = out.get(i);
+            return ts;
+        }
+    }
+
     @Override public long cpuTimeMillis() { return System.currentTimeMillis() - createdMillis; }
 
     @Override public void close() {
@@ -1503,6 +1578,17 @@ public final class VkDevice implements GfxDevice {
                         "vkMapMemory(upload)");
                 ByteBuffer mapped = MemoryUtil.memByteBuffer(p.get(0), src.remaining());
                 mapped.put(src);
+                vkUnmapMemory(device.device, memory);
+            }
+        }
+
+        void readHost(long offset, ByteBuffer dst) {
+            try (MemoryStack stack = MemoryStack.stackPush()) {
+                PointerBuffer p = stack.mallocPointer(1);
+                check(vkMapMemory(device.device, memory, offset, dst.remaining(), 0, p),
+                        "vkMapMemory(readback)");
+                ByteBuffer mapped = MemoryUtil.memByteBuffer(p.get(0), dst.remaining());
+                dst.put(mapped);
                 vkUnmapMemory(device.device, memory);
             }
         }

@@ -35,6 +35,7 @@ import org.lwjgl.vulkan.VkRect2D;
 import org.lwjgl.vulkan.VkRenderPassBeginInfo;
 import org.lwjgl.vulkan.VkViewport;
 
+import static org.lwjgl.vulkan.KHRSwapchain.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 import static org.lwjgl.vulkan.VK13.*;
 
 /**
@@ -712,20 +713,37 @@ public final class VkCommandBuffer implements GfxCommandBuffer {
                                   int srcAccess, int dstAccess) {
         checkRecording("barrier");
         VkImage img = device.ownImage(image);
-        int mappedFrom = VkEnumMap.imageLayout(from);
-        int mappedTo = VkEnumMap.imageLayout(to);
+        int mappedFrom = layoutForDevice(from);
+        int mappedTo = layoutForDevice(to);
         int tracked = device.currentLayout(img.handle);
         // The tracker's layout wins over the graph's from-state: uploads happen
         // outside the graph, and oldLayout=UNDEFINED would let the driver
         // discard bytes the host just wrote. A healed barrier pays for its
-        // caution with an ALL_COMMANDS source stage.
-        int oldLayout = (tracked == VK_IMAGE_LAYOUT_UNDEFINED) ? mappedFrom : tracked;
-        int srcStage = (oldLayout == mappedFrom) ? VkEnumMap.stageForState(from)
-                : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        // caution with an ALL_COMMANDS source stage. One named exception: a
+        // PRESENT from-state on an image the tracker has never seen is the
+        // first present of a fresh image - there is nothing to preserve, the
+        // presenting side rewrites the whole image, so the canonical
+        // UNDEFINED discard transition is the honest old layout.
+        int oldLayout;
+        int srcStage;
+        int actualSrcAccess = srcAccess;
+        if (tracked != VK_IMAGE_LAYOUT_UNDEFINED) {
+            oldLayout = tracked;
+            srcStage = (oldLayout == mappedFrom) ? VkEnumMap.stageForState(from)
+                    : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        } else if (from == dev.auralite.render.rhi.GfxEnums.ResourceState.PRESENT) {
+            oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            srcStage = VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT;
+            actualSrcAccess = 0;
+        } else {
+            oldLayout = mappedFrom;
+            srcStage = (oldLayout == mappedFrom) ? VkEnumMap.stageForState(from)
+                    : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+        }
         try (MemoryStack stack = MemoryStack.stackPush()) {
             VkImageMemoryBarrier.Buffer barrier = VkImageMemoryBarrier.calloc(1, stack)
                     .sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
-                    .srcAccessMask(VkEnumMap.accessFlags(srcAccess))
+                    .srcAccessMask(VkEnumMap.accessFlags(actualSrcAccess))
                     .dstAccessMask(VkEnumMap.accessFlags(dstAccess))
                     .oldLayout(oldLayout).newLayout(mappedTo)
                     .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
@@ -739,6 +757,19 @@ public final class VkCommandBuffer implements GfxCommandBuffer {
         }
         device.setLayout(img.handle, mappedTo);
         count();
+    }
+
+    /**
+     * {@code VK_IMAGE_LAYOUT_PRESENT_SRC_KHR} needs VK_KHR_swapchain, which
+     * this device never enables - the PRESENT state translates to GENERAL,
+     * the legal stand-in for "the presenting side owns this image".
+     */
+    private int layoutForDevice(dev.auralite.render.rhi.GfxEnums.ResourceState state) {
+        int layout = VkEnumMap.imageLayout(state);
+        if (layout == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR && !device.swapchainEnabled()) {
+            return VK_IMAGE_LAYOUT_GENERAL;
+        }
+        return layout;
     }
 
     @Override public void barrier(GfxBuffer buffer, int srcAccess, int dstAccess) {

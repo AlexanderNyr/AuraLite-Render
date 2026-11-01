@@ -41,6 +41,16 @@ public interface GfxDevice extends AutoCloseable {
                            int w, int h, int d, ByteBuffer src);
 
     // ---- frame --------------------------------------------------------
+    // ---- readback --------------------------------------------------------
+    /**
+     * The image's pixels exactly as the device holds them: mip 0, row-major
+     * RGBA8, {@code width * height * 4} bytes. The GPU gate hashes these
+     * bytes - a blank result means no frame reached the image. The RGBA8
+     * family only; anything else refuses by name, and the null device
+     * records a violation (it has no pixels to hash).
+     */
+    byte[] readImage(GfxImage image);
+
     /** Begins a frame; returns a monotonically increasing frame id. */
     long beginFrame();
     void submit(QueueType queue, GfxCommandBuffer cmd);
@@ -59,6 +69,13 @@ public interface GfxDevice extends AutoCloseable {
     String lastError();
     /** Milliseconds spent inside this device since creation (CPU-side, honest). */
     long cpuTimeMillis();
+    /**
+     * GPU timestamps (nanoseconds) written during the last frame, in write
+     * order - the gate asserts they are strictly increasing. Empty when the
+     * frame wrote none; the null device has no clock to read and returns
+     * empty too.
+     */
+    long[] frameTimestamps();
 
     @Override void close();
 }

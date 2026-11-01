@@ -54,7 +54,7 @@ Three layers, bottom up:
 | Perf | `make bench` | graph + biome + uniform gates, 5×, no timing in receipts |
 | Lint | `packlint` | exit non-zero on error, `--strict` promotes warnings |
 | Drift | `drift-check` | suite numbers may not move without their doc lines |
-| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps — software host now GREEN: vk + gl RENDERED (44 commands / 13 barriers / 6 passes each, exit 0; GL through zink with `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink`); hashes, validation-clean, timestamps and a discrete card still owed |
+| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps — software host GREEN, all three in the receipts: vk + gl RENDERED, 46 commands / 13 barriers / 6 passes each, byte-stable pixel sha256, strictly increasing GPU timestamps, zero validation lines with the banner on, exit 0 (GL through zink with `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink`); a discrete NVIDIA/AMD card remains owed |
 | Parity | legacy suite | AuraLite-Shaders pixels match the reference loader |
 
 ## What is deliberately not in the plan

@@ -42,6 +42,12 @@ refused without killing the buffer.
   depth or integer images is refused), mipmap generation.
 - **Barriers**: image (state + access pair), buffer (access pair),
   `memoryBarrierAll`. Push constants and timestamps round out the set.
+- **Frame evidence**: `readImage` returns mip 0 as row-major RGBA8 bytes
+  (the GPU gate hashes them; the RGBA8 family only - Vulkan also requires
+  `IMAGE_TRANSFER_SRC` on the image by name, GL has no usage flags and
+  refuses the window handle 0 by name instead), and `frameTimestamps()`
+  returns the frame's GPU timestamps in write order for a strictly-
+  increasing assertion after `waitIdle`.
 
 Every command validates usage flags exactly like NULL does. Indirect
 strides default honestly: 16 bytes for arrays, 20 for indexed.
@@ -55,7 +61,7 @@ strides default honestly: 16 bytes for arrays, 20 for indexed.
 | Push constants | reserved 128 B UBO | one range, stages from the layout |
 | Layouts | none (API has none) | tracked per image; the tracker wins over stale graph state |
 | Render passes | FBO cache, hex completeness | cached, keyed with incoming layouts so LOAD survives frame 2 |
-| Timestamps | 64-query ring, capture-oriented | 256-query pool, reset per frame |
+| Timestamps | 64-query ring, CPU-readable after finish | 256-query pool, reset per frame, read back with WAIT |
 | Shaders | SPIR-V via `GL_ARB_gl_spirv`, else GLSL | SPIR-V only |
 
 Neither backend owns a swapchain: presentation is fabric glue. Handle 0 on

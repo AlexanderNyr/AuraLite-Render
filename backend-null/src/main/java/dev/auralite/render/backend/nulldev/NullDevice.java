@@ -392,6 +392,12 @@ public final class NullDevice implements GfxDevice {
         return cb;
     }
 
+    @Override public byte[] readImage(GfxImage image) {
+        violate("readImage: the null device has no pixels to hash (image '"
+                + (image == null ? "?" : image.desc().debugName) + "')");
+        return new byte[0];
+    }
+
     @Override public void uploadBuffer(GfxBuffer dst, ByteBuffer src, long dstOffsetBytes) {
         long t = System.nanoTime();
         if (!(dst instanceof NullBuffer)) { violate("uploadBuffer to a foreign buffer"); return; }
@@ -459,6 +465,8 @@ public final class NullDevice implements GfxDevice {
     }
 
     @Override public long beginFrame() { return ++frameId; }
+
+    @Override public long[] frameTimestamps() { return new long[0]; }
 
     @Override public void submit(QueueType queue, GfxCommandBuffer cmd) {
         long t = System.nanoTime();

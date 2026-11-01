@@ -144,7 +144,8 @@ public final class GpuSmoke {
                     ? "ON (AURALITE_VK_VALIDATION=1)" : "off";
             System.out.println("GPU vk: device \"" + dev.deviceName() + "\", validation " + validation);
             GfxImage backbuffer = dev.createImage(GfxDesc.Image.tex2d(WIDTH, HEIGHT, GfxFormat.RGBA8_UNORM,
-                    GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT).named("window"));
+                    GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT
+                    | GfxUsage.IMAGE_TRANSFER_SRC).named("window"));
             String receipt = runFrame(dev, true, backbuffer);
             System.out.println("GPU vk: RENDERED - " + receipt);
             return true;
@@ -245,7 +246,13 @@ public final class GpuSmoke {
                     + version + "\", GLSL \"" + glsl + "\", core=" + capsOpenGLCore(caps));
 
             dev = new GlDevice();
-            GfxImage backbuffer = dev.defaultFramebuffer(WIDTH, HEIGHT);
+            // Offscreen, not the window: on a surfaceless context the default
+            // framebuffer has no storage to hash - the pixel gate needs an
+            // image the readback can actually see (the real window presents
+            // with the fabric glue, phase 4).
+            GfxImage backbuffer = dev.createImage(GfxDesc.Image.tex2d(WIDTH, HEIGHT,
+                    GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_COLOR_ATTACHMENT
+                    | GfxUsage.IMAGE_PRESENT | GfxUsage.IMAGE_TRANSFER_SRC).named("window"));
             String receipt = runFrame(dev, false, backbuffer);
             System.out.println("GPU gl: RENDERED - " + receipt);
             return true;
@@ -308,17 +315,58 @@ public final class GpuSmoke {
         dev.beginFrame();
         GfxCommandBuffer cmd = dev.createCommandBuffer(QueueType.GRAPHICS);
         cmd.begin();
+        cmd.writeTimestamp(0);
         compiled.execute(new GraphContext(dev, cmd, compiled, new FrameContext()));
+        cmd.writeTimestamp(1);
         cmd.end();
         dev.submit(QueueType.GRAPHICS, cmd);
         dev.waitIdle();
         dev.endFrame();
 
+        // The frame is not "rendered" until its pixels exist: hash mip 0 of
+        // the backbuffer, and refuse to call the frame anything if the bytes
+        // are all zero (rule: never claim a frame that isn't there).
+        byte[] pixels = dev.readImage(backbuffer);
+        int nonzero = 0;
+        for (byte b : pixels) if (b != 0) nonzero++;
+        if (pixels.length == 0 || nonzero == 0) {
+            throw new GfxException("gpu smoke: readback of the backbuffer is "
+                    + (pixels.length == 0 ? "empty" : "all " + pixels.length + " bytes zero")
+                    + " - no frame reached the image");
+        }
+        long[] ts = dev.frameTimestamps();
+        if (ts.length < 2) {
+            throw new GfxException("gpu smoke: expected 2 frame timestamps, got "
+                    + java.util.Arrays.toString(ts));
+        }
+        for (int i = 1; i < ts.length; i++) {
+            if (ts[i] <= ts[i - 1]) {
+                throw new GfxException("gpu smoke: timestamps not strictly increasing: "
+                        + java.util.Arrays.toString(ts));
+            }
+        }
         String receipt = cmd.commandCount() + " commands, " + compiled.totalBarriers()
                 + " barriers, " + compiled.passOrder().size() + " passes, 0 violations (none raised), "
-                + WIDTH + "x" + HEIGHT + " on \"" + dev.deviceName() + "\"";
+                + WIDTH + "x" + HEIGHT + " on \"" + dev.deviceName() + "\""
+                + "; pixels sha256=" + sha256Hex(pixels)
+                + " nonzero=" + nonzero + "/" + pixels.length
+                + "; timestamps " + ts[0] + " < " + ts[ts.length - 1];
         compiled.release();
         return receipt;
+    }
+
+    static String sha256Hex(byte[] data) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            StringBuilder sb = new StringBuilder(64);
+            for (byte b : md.digest(data)) {
+                sb.append(Character.forDigit((b >> 4) & 0xF, 16));
+                sb.append(Character.forDigit(b & 0xF, 16));
+            }
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new GfxException("gpu smoke: SHA-256 unavailable: " + e.getMessage());
+        }
     }
 
     // ----------------------------------------------------------- providers
