@@ -526,6 +526,14 @@ public final class GlDevice implements GfxDevice {
      * The window-system backbuffer as an RHI image. Handle 0 means the default
      * framebuffer; a pass may not mix it with offscreen attachments.
      */
+    /** Texture object name of a device image (fabric present blit reads it). */
+    public int textureName(GfxImage image) {
+        if (!(image instanceof GlImage)) {
+            throw new GfxException("textureName: not a GL image of this device");
+        }
+        return ((GlImage) image).name;
+    }
+
     public GfxImage defaultFramebuffer(int width, int height) {
         GfxDesc.Image desc = GfxDesc.Image.tex2d(width, height, GfxFormat.RGBA8_UNORM,
                 GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT).named("window");

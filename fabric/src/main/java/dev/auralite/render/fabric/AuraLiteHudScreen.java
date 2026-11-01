@@ -62,11 +62,14 @@ public final class AuraLiteHudScreen extends Screen {
                 + "Reload re-reads the pack.");
     }
 
-    /** One trimmed line; returns the next y. */
+    /** One logical line, wrapped to the screen width; returns the next y. */
     private int line(DrawContext ctx, int x, int y, String text) {
-        String trimmed = textRenderer.trimToWidth(text, width - 2 * x);
-        ctx.drawTextWithShadow(textRenderer, trimmed, x, y, 0xE0E0E0);
-        return y + 11;
+        for (net.minecraft.text.OrderedText wrapped
+                : textRenderer.wrapLines(net.minecraft.text.Text.literal(text), width - 2 * x)) {
+            ctx.drawTextWithShadow(textRenderer, wrapped, x, y, 0xE0E0E0);
+            y += 11;
+        }
+        return y;
     }
 
     @Override
