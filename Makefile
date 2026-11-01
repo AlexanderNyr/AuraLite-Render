@@ -7,6 +7,13 @@ JAVAC ?= javac
 JAVA ?= java
 
 LWJGL_VERSION = 3.4.3
+
+# javac/java on Windows split the classpath with ';', Unix with ':'.
+ifeq ($(OS),Windows_NT)
+CPSEP = ;
+else
+CPSEP = :
+endif
 # Maven Central via the Aliyun mirror: repo1.maven.org resets connections
 # from some regions (curl error 35). To go back to Central directly:
 #   MAVEN = https://repo1.maven.org/maven2/org/lwjgl
@@ -41,8 +48,8 @@ help:
 > @echo "  drift-check - replay the suite receipts; they must match the doc lines or fail by name"
 
 deps: $(LWJGL_JARS)
-> @echo "GL46 present: $$(unzip -l $(THIRD_PARTY)/lwjgl-opengl.jar | grep -c 'GL46.class') class(es)"
-> @echo "VK13 present: $$(unzip -l $(THIRD_PARTY)/lwjgl-vulkan.jar | grep -c 'VK13.class') class(es)"
+> @echo "GL46 present: $$( { unzip -l $(THIRD_PARTY)/lwjgl-opengl.jar 2>/dev/null || jar tf $(THIRD_PARTY)/lwjgl-opengl.jar; } | grep -c 'GL46.class') class(es)"
+> @echo "VK13 present: $$( { unzip -l $(THIRD_PARTY)/lwjgl-vulkan.jar 2>/dev/null || jar tf $(THIRD_PARTY)/lwjgl-vulkan.jar; } | grep -c 'VK13.class') class(es)"
 
 $(THIRD_PARTY)/lwjgl.jar:
 > @mkdir -p $(THIRD_PARTY)
@@ -81,26 +88,26 @@ build: deps
 > @echo "--- backend-gl (against third_party jars) ---"
 > @if [ -n "$$(find backend-gl/src -name '*.java' 2>/dev/null)" ]; then \
       find backend-gl/src -name '*.java' | sort > $(BUILD)/gl-sources.txt; \
-      $(JAVAC) -cp $(CORE_CLASSES):$(THIRD_PARTY)/lwjgl.jar:$(THIRD_PARTY)/lwjgl-opengl.jar \
+      $(JAVAC) -cp "$(CORE_CLASSES)$(CPSEP)$(THIRD_PARTY)/lwjgl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-opengl.jar" \
         -d $(GL_CLASSES) @$(BUILD)/gl-sources.txt; \
     else echo "backend-gl: no sources yet, SKIP"; fi
 > @echo "--- backend-vulkan (against third_party jars) ---"
 > @if [ -n "$$(find backend-vulkan/src -name '*.java' 2>/dev/null)" ]; then \
       find backend-vulkan/src -name '*.java' | sort > $(BUILD)/vk-sources.txt; \
-      $(JAVAC) -cp $(CORE_CLASSES):$(THIRD_PARTY)/lwjgl.jar:$(THIRD_PARTY)/lwjgl-vulkan.jar \
+      $(JAVAC) -cp "$(CORE_CLASSES)$(CPSEP)$(THIRD_PARTY)/lwjgl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-vulkan.jar" \
         -d $(VK_CLASSES) @$(BUILD)/vk-sources.txt; \
     else echo "backend-vulkan: no sources yet, SKIP"; fi
 > @echo "--- tests ---"
 > find tests/src -name '*.java' ! -name 'GpuSmoke.java' | sort > $(BUILD)/tests-sources.txt
-> $(JAVAC) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES) \
+> $(JAVAC) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)" \
       -d $(TEST_CLASSES) @$(BUILD)/tests-sources.txt
 > @echo "--- gpu smoke (against third_party jars; Phase 5 lane) ---"
 > find tests/src -name 'GpuSmoke.java' | sort > $(BUILD)/gpu-sources.txt
-> $(JAVAC) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(THIRD_PARTY)/lwjgl.jar:$(THIRD_PARTY)/lwjgl-opengl.jar:$(THIRD_PARTY)/lwjgl-egl.jar \
+> $(JAVAC) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)$(CPSEP)$(THIRD_PARTY)/lwjgl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-opengl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-egl.jar" \
       -d $(GPU_CLASSES) @$(BUILD)/gpu-sources.txt
 > @echo "--- tools (packlint, drift-check) ---"
 > find tools -name '*.java' | sort > $(BUILD)/tools-sources.txt
-> $(JAVAC) -cp $(CORE_CLASSES):$(NULL_CLASSES) -d $(TOOLS_CLASSES) @$(BUILD)/tools-sources.txt
+> $(JAVAC) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)" -d $(TOOLS_CLASSES) @$(BUILD)/tools-sources.txt
 > @echo "--- fabric (java 21 + gradle/loom; sources + json only in this lane) ---"
 > @major=$$($(JAVAC) -version 2>&1 | sed -n 's/^javac[ ]*\([0-9]*\).*/\1/p'); \
     if [ -n "$$major" ] && [ "$$major" -ge 21 ]; then \
@@ -114,7 +121,7 @@ build: deps
 # pure data and must load with no LWJGL present. A NoClassDefFoundError in the
 # tables suite means a real GL/VK call leaked into a mapping function.
 test: build
-> $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(TEST_CLASSES) \
+> $(JAVA) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)$(CPSEP)$(TEST_CLASSES)" \
       dev.auralite.render.tests.RunAll
 
 # Phase 5 groundwork: run OUR real backends on this host's GPU. Software
@@ -128,25 +135,25 @@ test: build
 # EGL_PLATFORM=surfaceless: headless hosts have neither /dev/dri (GBM) nor an
 # X server; Mesa's surfaceless EGL platform is the honest display there.
 gpu-test: build
-> AURALITE_VK_VALIDATION=$${AURALITE_VK_VALIDATION:-1} EGL_PLATFORM=surfaceless $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(TEST_CLASSES):$(GPU_CLASSES):$(THIRD_PARTY)/lwjgl.jar:$(THIRD_PARTY)/lwjgl-opengl.jar:$(THIRD_PARTY)/lwjgl-egl.jar:$(THIRD_PARTY)/lwjgl-vulkan.jar:$(THIRD_PARTY)/lwjgl-natives-linux.jar:$(THIRD_PARTY)/lwjgl-opengl-natives-linux.jar \
+> AURALITE_VK_VALIDATION=$${AURALITE_VK_VALIDATION:-1} EGL_PLATFORM=surfaceless $(JAVA) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)$(CPSEP)$(TEST_CLASSES)$(CPSEP)$(GPU_CLASSES)$(CPSEP)$(THIRD_PARTY)/lwjgl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-opengl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-egl.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-vulkan.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-natives-linux.jar$(CPSEP)$(THIRD_PARTY)/lwjgl-opengl-natives-linux.jar" \
       dev.auralite.render.tests.GpuSmoke $(or $(LANE),all)
 
 bench: build
 > @for i in 1 2 3 4 5; do \
-      $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(TEST_CLASSES) \
+      $(JAVA) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)$(CPSEP)$(TEST_CLASSES)" \
         dev.auralite.render.tests.RunAll --receipts 2>&1 | grep -E '^(TOTAL|RESULT)'; \
     done
 
 # Usage: make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]
 packlint: build
 > @test -n "$(PACK)" || { echo "usage: make packlint PACK=path/to/pack [STRICT=1] [NULL_DEVICE=1]"; exit 2; }
-> $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(TOOLS_CLASSES) \
+> $(JAVA) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(TOOLS_CLASSES)" \
 >       dev.auralite.render.tools.packlint.PackLint $(PACK) \
 >       $(if $(STRICT),--strict,) $(if $(NULL_DEVICE),--null-device,)
 
 # Replays the host gate and compares its receipts with docs/STATUS.md and README.md.
 drift-check: build
-> $(JAVA) -cp $(CORE_CLASSES):$(NULL_CLASSES):$(GL_CLASSES):$(VK_CLASSES):$(TEST_CLASSES):$(TOOLS_CLASSES) \
+> $(JAVA) -cp "$(CORE_CLASSES)$(CPSEP)$(NULL_CLASSES)$(CPSEP)$(GL_CLASSES)$(CPSEP)$(VK_CLASSES)$(CPSEP)$(TEST_CLASSES)$(CPSEP)$(TOOLS_CLASSES)" \
 >       dev.auralite.render.tools.drift.DriftCheck
 
 clean:
