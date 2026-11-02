@@ -311,6 +311,22 @@ public final class GpuSmoke {
         compiled.allocate(dev);
 
         compiled.bindImported("backbuffer", backbuffer);
+        // The reference pack reads the host's captured vanilla frame; bind it
+        // the way the fabric lane (SceneCapture) does - same guard: a pack
+        // without the scene resource needs no binding. The scene starts empty
+        // (no vanilla frame exists here), so fill it with a nonzero pattern:
+        // the final stage copies scene -> backbuffer, and the pixel gate must
+        // see a frame that actually travelled through the pack.
+        if (manifest.graph.findResource("scene") != null) {
+            GfxImage sceneImg = dev.createImage(GfxDesc.Image.tex2d(WIDTH, HEIGHT,
+                    GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_STORAGE | GfxUsage.IMAGE_SAMPLED
+                            | GfxUsage.IMAGE_COLOR_ATTACHMENT).named("scene"));
+            compiled.bindImported("scene", sceneImg);
+            java.nio.ByteBuffer px = java.nio.ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4);
+            while (px.hasRemaining()) px.put((byte) 0x40);
+            px.flip();
+            dev.uploadImage(sceneImg, 0, px);
+        }
 
         dev.beginFrame();
         GfxCommandBuffer cmd = dev.createCommandBuffer(QueueType.GRAPHICS);

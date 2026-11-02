@@ -33,8 +33,13 @@ public final class AuraLiteHudScreen extends Screen {
             RendererLoop.requestPackReload();
             close();
         }).dimensions(cx, y + 26, 200, 20).build());
-        addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
+        addDrawableChild(ButtonWidget.builder(
+                Text.literal(RendererLoop.presentEnabled() ? "Present: ON" : "Present: OFF"),
+                b -> { RendererLoop.togglePresent(); b.setMessage(Text.literal(
+                        RendererLoop.presentEnabled() ? "Present: ON" : "Present: OFF")); })
                 .dimensions(cx, y + 52, 200, 20).build());
+        addDrawableChild(ButtonWidget.builder(Text.literal("Close"), b -> close())
+                .dimensions(cx, y + 78, 200, 20).build());
     }
 
     @Override

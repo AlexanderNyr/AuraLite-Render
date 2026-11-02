@@ -86,9 +86,15 @@ public final class PackOption {
         }
     }
 
-    /** The {@code #define} line this option contributes, empty for CONST. */
+    /**
+     * The {@code #define} line this option contributes; empty when the option
+     * contributes nothing (a boolean that is off). CONST carries its value as
+     * a define too - a shader branches on it with {@code #if NAME == n}, which
+     * is how the reference pack's debug view switches without a rebuild of
+     * the pipeline layout.
+     */
     public String defineFor(String value) {
-        if (kind == Kind.CONST) return "";
+        if (kind == Kind.CONST) return "#define " + name + " " + value;
         if (kind == Kind.BOOL) {
             boolean on = value.equals("true") || value.equals("1");
             return on ? "#define " + name : "";

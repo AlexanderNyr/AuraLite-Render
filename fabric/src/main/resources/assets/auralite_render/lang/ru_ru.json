@@ -1,4 +1,6 @@
 {
   "category.auralite_render": "AuraLite-Render",
-  "key.auralite_render.menu": "Экран состояния рендера"
+  "key.auralite_render.menu": "Экран состояния рендера",
+  "key.auralite_render.toggle_present": "Показ кадра пака",
+  "key.auralite_render.cycle_debug_view": "Режим отладки пака"
 }

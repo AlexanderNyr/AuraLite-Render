@@ -3,7 +3,7 @@
   "package": "dev.auralite.render.fabric.mixin",
   "compatibilityLevel": "JAVA_21",
   "client": [
-    "GameRendererMixin"
+    "MinecraftClientMixin"
   ],
   "injectors": {
     "defaultRequire": 1

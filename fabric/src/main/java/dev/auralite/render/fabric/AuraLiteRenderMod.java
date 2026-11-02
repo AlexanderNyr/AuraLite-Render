@@ -39,11 +39,25 @@ public final class AuraLiteRenderMod implements ClientModInitializer {
         KeyBinding menu = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.auralite_render.menu", InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_RIGHT_SHIFT, "category.auralite_render"));
+        // F8 toggles the pack's output even when the gradient covers the GUI.
+        KeyBinding toggle = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.auralite_render.toggle_present", InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_F8, "category.auralite_render"));
+        // F9 cycles the pack's debug view over the captured vanilla frame.
+        KeyBinding debugView = KeyBindingHelper.registerKeyBinding(new KeyBinding(
+                "key.auralite_render.cycle_debug_view", InputUtil.Type.KEYSYM,
+                GLFW.GLFW_KEY_F9, "category.auralite_render"));
         ClientTickEvents.END_CLIENT_TICK.register(client -> {
             while (menu.wasPressed()) {
                 if (client.currentScreen == null) {
                     client.setScreen(new AuraLiteHudScreen());
                 }
+            }
+            while (toggle.wasPressed()) {
+                RendererLoop.togglePresent();
+            }
+            while (debugView.wasPressed()) {
+                RendererLoop.cycleDebugView();
             }
         });
     }

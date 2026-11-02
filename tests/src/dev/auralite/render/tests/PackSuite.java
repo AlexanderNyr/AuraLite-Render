@@ -523,6 +523,13 @@ public final class PackSuite {
         rc.bindImported("backbuffer", rdev.createImage(GfxDesc.Image.tex2d(1920, 1080,
                 GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT)
                 .named("window")));
+        // The reference pack also reads the host's captured vanilla frame;
+        // the imported scene texture is bound the same way the fabric lane
+        // binds it (SceneCapture) - unbound, the present pass must not run.
+        rc.bindImported("scene", rdev.createImage(GfxDesc.Image.tex2d(1920, 1080,
+                GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_STORAGE | GfxUsage.IMAGE_SAMPLED
+                        | GfxUsage.IMAGE_COLOR_ATTACHMENT)
+                .named("scene")));
         rdev.beginFrame();
         RecordingCommandBuffer rcb = (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
         rcb.begin();

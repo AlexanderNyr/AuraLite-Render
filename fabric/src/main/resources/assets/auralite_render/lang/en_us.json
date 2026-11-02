@@ -1,4 +1,6 @@
 {
   "category.auralite_render": "AuraLite-Render",
-  "key.auralite_render.menu": "Render status screen"
+  "key.auralite_render.menu": "Render status screen",
+  "key.auralite_render.toggle_present": "Toggle pack present",
+  "key.auralite_render.cycle_debug_view": "Cycle pack debug view"
 }

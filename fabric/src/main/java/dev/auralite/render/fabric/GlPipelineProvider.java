@@ -6,9 +6,13 @@ import dev.auralite.render.pack.PackProgram;
 import dev.auralite.render.pack.PipelineProvider;
 import dev.auralite.render.rhi.GfxDesc;
 import dev.auralite.render.rhi.GfxPipeline;
+import dev.auralite.render.rhi.GfxShaderModule;
 import dev.auralite.render.rhi.GfxStage;
+import dev.auralite.render.rhi.ShaderSource;
 
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -30,6 +34,8 @@ public final class GlPipelineProvider implements PipelineProvider {
     private final GlDevice device;
     private final PackManifest pack;
     private final Map<String, GfxPipeline> cache = new HashMap<String, GfxPipeline>();
+    /** Stages this provider created - closed with the cache on invalidate. */
+    private final List<GfxShaderModule> modules = new ArrayList<GfxShaderModule>();
 
     public GlPipelineProvider(GlDevice device, PackManifest pack) {
         this.device = device;
@@ -47,10 +53,14 @@ public final class GlPipelineProvider implements PipelineProvider {
         PackProgram p = pack.program(programName);
         GfxDesc.GraphicsPipeline desc = new GfxDesc.GraphicsPipeline().named(programName);
         if (p != null && p.stage(GfxStage.VERTEX) != null) {
-            desc.stage(device.createShaderModule(p.stage(GfxStage.VERTEX)));
+            GfxShaderModule vs = device.createShaderModule(optionDefines(p.stage(GfxStage.VERTEX)));
+            modules.add(vs);
+            desc.stage(vs);
         }
         if (p != null && p.stage(GfxStage.FRAGMENT) != null) {
-            desc.stage(device.createShaderModule(p.stage(GfxStage.FRAGMENT)));
+            GfxShaderModule fs = device.createShaderModule(optionDefines(p.stage(GfxStage.FRAGMENT)));
+            modules.add(fs);
+            desc.stage(fs);
         }
         GfxPipeline pipe = device.createGraphicsPipeline(desc);
         cache.put(key, pipe);
@@ -65,8 +75,10 @@ public final class GlPipelineProvider implements PipelineProvider {
 
         PackProgram p = pack.program(programName);
         if (p == null || p.stage(GfxStage.COMPUTE) == null) return null;
+        GfxShaderModule cs = device.createShaderModule(optionDefines(p.stage(GfxStage.COMPUTE)));
+        modules.add(cs);
         GfxPipeline pipe = device.createComputePipeline(GfxDesc.ComputePipeline
-                .of(device.createShaderModule(p.stage(GfxStage.COMPUTE)))
+                .of(cs)
                 .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
                 .named(programName));
         cache.put(key, pipe);
@@ -79,9 +91,36 @@ public final class GlPipelineProvider implements PipelineProvider {
         return p != null && p.stageCount() > 0;
     }
 
-    /** Called on pack reload/resize: pipelines are pack- and size-bound. */
-    public void invalidate() {
+    /**
+     * The stage with the pack's active option defines prepended - the option
+     * lane (bool/select/slider/const) reaching the GLSL compiler. SPIR-V
+     * sources pass through untouched: they were already compiled against a
+     * fixed option set and cannot take preprocessor defines.
+     */
+    private ShaderSource optionDefines(ShaderSource src) {
+        if (src == null || src.kind() != ShaderSource.Kind.GLSL) return src;
+        // activeDefines() hands out complete "#define NAME value" lines for
+        // direct emission; withDefines() takes the bare "NAME value" token
+        // and prepends "#define " itself. Passing the line through unchanged
+        // yields "#define #define ..." - C0105 on every option line, which
+        // only a real GLSL compiler (the player's GPU, gpu-test) sees; the
+        // NULL device validates structure only.
+        java.util.List<String> bare = new java.util.ArrayList<String>();
+        for (String line : pack.activeDefines()) {
+            if (line.startsWith("#define ")) line = line.substring("#define ".length());
+            if (!line.isEmpty()) bare.add(line);
+        }
+        return bare.isEmpty() ? src : src.withDefines(bare);
+    }
+
+    /** Called on pack reload/resize: pipelines are pack- and size-bound. */    public void invalidate() {
         for (GfxPipeline pipe : cache.values()) pipe.close();
         cache.clear();
+        // Shader stages die with their pipelines: a reload used to leave
+        // every module behind (live count grew by ~8 per F9 rebuild - 240
+        // after ~30 reloads on the GT 710 run). close() is idempotent and
+        // GlDevice.close() may close them again later.
+        for (GfxShaderModule m : modules) m.close();
+        modules.clear();
     }
 }

@@ -69,9 +69,9 @@ public final class FabricSuite {
         try {
             String mj = read(mixinsJson);
             contains(mj, "\"JAVA_21\"", "the mixin compatibility level is java 21");
-            contains(mj, "GameRendererMixin", "the frame hook mixin is listed");
+            contains(mj, "MinecraftClientMixin", "the frame hook mixin is listed");
             Path mixinSrc = root.resolve(
-                    "src/main/java/dev/auralite/render/fabric/mixin/GameRendererMixin.java");
+                    "src/main/java/dev/auralite/render/fabric/mixin/MinecraftClientMixin.java");
             check(Files.isRegularFile(mixinSrc), "GameRendererMixin.java exists");
             contains(read(mixinSrc), "RendererLoop.frame",
                     "the mixin drives the renderer loop");
@@ -114,6 +114,37 @@ public final class FabricSuite {
                     "and names what the lane needs");
         } catch (Exception e) {
             check(false, "the Makefile could not be read: " + e);
+        }
+
+        section("frame context bridge: world state reaches the graph");
+        try {
+            Path bridge = root.resolve(
+                    "src/main/java/dev/auralite/render/fabric/FrameBridge.java");
+            check(Files.isRegularFile(bridge), "FrameBridge.java exists");
+            String b = read(bridge);
+            contains(b, "ViewMatrix.compute",
+                    "the view matrix is rebuilt from the camera (RenderSystem is GUI-owned by hook time)");
+            contains(b, "getBasicProjectionMatrix",
+                    "the projection comes from Minecraft's own function");
+            contains(b, "finishCameraUpdate",
+                    "derived matrices and the frustum are recomputed after the fill");
+            contains(b, "client.world",
+                    "world fields are read from the live world (menu leaves them stale, not zeroed)");
+
+            Path loop = root.resolve(
+                    "src/main/java/dev/auralite/render/fabric/RendererLoop.java");
+            String l = read(loop);
+            int begin = l.indexOf("frame.beginFrame");
+            int fill = l.indexOf("FrameBridge.fill");
+            check(begin >= 0 && fill > begin,
+                    "RendererLoop fills the frame context AFTER beginFrame "
+                            + "(previous-frame snapshot first, then this frame's values)");
+
+            check(Files.isRegularFile(Paths.get(
+                            "core/src/main/java/dev/auralite/render/scene/ViewMatrix.java")),
+                    "ViewMatrix lives in core where the host suite can gate it");
+        } catch (Exception e) {
+            check(false, "the frame bridge could not be read: " + e);
         }
 
         receipt("fabric: sources + json gated (7 sources, entrypoint, mixins, java 21); "

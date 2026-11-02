@@ -26,6 +26,7 @@ scene_depth  = d32_sfloat fullscreen usage=depth|sampled
 ao           = r16f scaled=0.5 usage=storage|sampled
 taa          = rgba16f fullscreen history
 backbuffer   = rgba8_unorm fullscreen imported usage=color|present
+scene        = rgba8_unorm fullscreen imported usage=storage
 biome_volume = rgba8_uint biome-volume 3d usage=sampled|storage
 
 [options]
@@ -40,7 +41,7 @@ pass terrain raster color=scene_color depth=scene_depth read=biome_volume progra
 pass biome_field compute write=biome_volume program=biome_field dispatch=ceil(width/8),ceil(height/8),1
 pass ssao compute write=ao read=scene_depth program=ssao dispatch=ceil(width/16),ceil(height/16),1 when=SSAO
 pass taa_resolve raster read=scene_color,ao,taa.prev color=taa.cur program=taa
-pass present raster read=taa.cur color=backbuffer external program=final
+pass present raster read=taa.cur,scene color=backbuffer external program=final
 present = taa
 
 [programs]

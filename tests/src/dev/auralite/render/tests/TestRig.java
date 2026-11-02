@@ -116,12 +116,17 @@ public final class TestRig {
         } catch (RuntimeException e) {
             threw = true;
         }
+        // A reddened gate counts even when it only called check()/fail():
+        // capture that BEFORE the rollback below, which resets the counter
+        // (the old code re-tested `failed > before` after resetting it, so
+        // only a throwing control could ever be credited).
+        boolean reddened = failed > before;
         // Roll back whatever the control recorded so it does not pollute totals.
-        if (failed > before) {
+        if (reddened) {
             failures.remove(failures.size() - 1);
             failed = before;
         }
-        if (threw || failed > before) { negativeControls++; return; }
+        if (threw || reddened) { negativeControls++; return; }
         fail("NEGATIVE CONTROL '" + what + "' did not redden -- the gate proves nothing", "failure", "success");
     }
 

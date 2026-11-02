@@ -31,6 +31,7 @@ public final class RunAll {
             suite("pack", new Runnable() { @Override public void run() { PackSuite.run(); } }),
             suite("tables", new Runnable() { @Override public void run() { BackendTableSuite.run(); } }),
             suite("fabric", new Runnable() { @Override public void run() { FabricSuite.run(); } }),
+            suite("view", new Runnable() { @Override public void run() { ViewMatrixSuite.run(); } }),
         };
 
         boolean onlyReceipts = args.length > 0 && args[0].equals("--receipts");

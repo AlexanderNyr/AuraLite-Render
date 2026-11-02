@@ -50,7 +50,7 @@ Three layers, bottom up:
 
 | Gate | Command | Bar |
 |---|---|---|
-| Host | `make test` | 1008/0, 8/8 green, OpenJDK 11 and 21 both measured, no GPU |
+| Host | `make test` | 1084/0, 9/9 green, OpenJDK 11 and 21 both measured, no GPU |
 | Perf | `make bench` | graph + biome + uniform gates, 5×, no timing in receipts |
 | Lint | `packlint` | exit non-zero on error, `--strict` promotes warnings |
 | Drift | `drift-check` | suite numbers may not move without their doc lines |

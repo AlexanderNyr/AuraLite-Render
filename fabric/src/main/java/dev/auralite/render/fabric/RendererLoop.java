@@ -56,12 +56,24 @@ public final class RendererLoop {
     private static String lastError;           // null while healthy; GUI + receipt
     private static long frames;                // successful frames since process start
     private static long lastFrameNanos = -1L;
+    private static boolean stopped;             // set by shutdown(): never re-init after it
+    private static boolean presentLogged;       // one present receipt per session
+    // OFF by default: the game must be playable out of the box; F8 (or the
+    // GUI button) demonstrates the pack's output when asked for.
+    private static boolean presentEnabled = false;
+    // The vanilla frame as a texture the graph reads (imported "scene").
+    private static SceneCapture capture;
+    // Option values this session forced onto the pack (F9 cycles DEBUG_VIEW);
+    // re-applied after every reload so a hot-reload from disk keeps them.
+    private static final java.util.Map<String, String> hostOptions =
+            new java.util.LinkedHashMap<String, String>();
+    private static int debugViewIndex;          // which DEBUG_VIEW value F9 set
 
     private RendererLoop() { }
 
     /** Called from the render-thread frame hook with the current framebuffer size. */
     public static void frame(boolean tick, int fbWidth, int fbHeight) {
-        if (failed) return;
+        if (stopped || failed) return;
         try {
             if (device == null) init(fbWidth, fbHeight);
 
@@ -70,13 +82,23 @@ public final class RendererLoop {
                 onDeviceContext(RendererLoop::rebuild);
             }
 
+            // Vanilla just drew the world into the default framebuffer and the
+            // swap has not flipped it yet - copy it into the pack's imported
+            // scene texture. Game context: that is where FB0 is the screen
+            // (see present()'s note on why FBOs cannot cross contexts).
+            capture.capture();
+
             pacer.beginFrame();
             long now = System.nanoTime();
             float deltaSeconds = lastFrameNanos < 0 ? 1.0f / 60.0f
                     : Math.min(1.0f, (now - lastFrameNanos) / 1.0e9f);
             lastFrameNanos = now;
 
-            onDeviceContext(() -> renderGraph(deltaSeconds, now));
+            net.minecraft.client.MinecraftClient client =
+                    net.minecraft.client.MinecraftClient.getInstance();
+            final int graphWidth = fbWidth, graphHeight = fbHeight;
+            onDeviceContext(() -> renderGraph(deltaSeconds, now, client,
+                    graphWidth, graphHeight));
             present();
             pacer.endFrame();
             frames++;
@@ -89,9 +111,14 @@ public final class RendererLoop {
     }
 
     /** The whole device-side frame; must run with the device context current. */
-    private static void renderGraph(float deltaSeconds, long now) {
+    private static void renderGraph(float deltaSeconds, long now,
+                                    net.minecraft.client.MinecraftClient client,
+                                    int fbWidth, int fbHeight) {
         long id = device.beginFrame();
         frame.beginFrame(id, now / 1.0e9f, deltaSeconds, now);
+        // After beginFrame (previous-frame snapshot first), before the graph:
+        // the pack's passes read the frame context this call fills.
+        FrameBridge.fill(frame, client, fbWidth, fbHeight);
         GfxCommandBuffer cmd = device.createCommandBuffer(QueueType.GRAPHICS);
         cmd.begin();
         labels.beginFrame(cmd);
@@ -109,12 +136,19 @@ public final class RendererLoop {
      * not shared between contexts, the color texture is.
      */
     private static void present() {
+        if (!presentEnabled) return;   // vanilla frame stays: MC's draw already filled the back buffer
         if (presentFbo == 0) presentFbo = GL30.glGenFramebuffers();
         int tex = swapchain.colorTexture();
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presentFbo);
-        GL30.glFramebufferTexture2D(GL30.GL_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
+        // glBlitFramebuffer writes into the DRAW binding: keep the source on
+        // READ (the FBO wrapping the shared texture) and the destination on
+        // DRAW = 0 (the screen's back buffer). Binding GL_FRAMEBUFFER for
+        // both made earlier revisions blit into the source and leave the
+        // screen untouched (r10-r12 receipts).
+        GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, presentFbo);
+        GL30.glFramebufferTexture2D(GL30.GL_READ_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
                 GL11.GL_TEXTURE_2D, tex, 0);
-        int status = GL30.glCheckFramebufferStatus(GL30.GL_FRAMEBUFFER);
+        GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, 0);
+        int status = GL30.glCheckFramebufferStatus(GL30.GL_READ_FRAMEBUFFER);
         if (status != GL30.GL_FRAMEBUFFER_COMPLETE) {
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
             throw new RuntimeException("present FBO incomplete: 0x" + Integer.toHexString(status));
@@ -122,7 +156,37 @@ public final class RendererLoop {
         GL30.glBlitFramebuffer(0, 0, swapchain.width(), swapchain.height(),
                 0, 0, swapchain.width(), swapchain.height(),
                 GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
+        // Second landing: the game's own main target. MC's F2 reads
+        // MinecraftClient.getFramebuffer() (handleInputEvents, render offset
+        // 363) - a buffer our screen blit never touched, so screenshots came
+        // out vanilla while the window showed the pack (the r20 run's
+        // complaint). The screen path above is untouched; this copy only
+        // feeds the screenshot buffer between this present and the next
+        // frame's draw. F8-off skips both: screenshot then matches the
+        // vanilla frame, as the button promises.
+        int mainFbo = MinecraftClient.getInstance().getFramebuffer().fbo;
+        if (mainFbo != 0) {
+            GL30.glBindFramebuffer(GL30.GL_DRAW_FRAMEBUFFER, mainFbo);
+            GL30.glBlitFramebuffer(0, 0, swapchain.width(), swapchain.height(),
+                    0, 0, MinecraftClient.getInstance().getFramebuffer().textureWidth,
+                    MinecraftClient.getInstance().getFramebuffer().textureHeight,
+                    GL11.GL_COLOR_BUFFER_BIT, GL11.GL_NEAREST);
+        }
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0);
+        if (!presentLogged) {
+            presentLogged = true;
+            long gameWindow = MinecraftClient.getInstance().getWindow().getHandle();
+            long ctx = org.lwjgl.glfw.GLFW.glfwGetCurrentContext();
+            java.nio.ByteBuffer px = org.lwjgl.BufferUtils.createByteBuffer(4);
+            // read the DEFAULT framebuffer - the screen's back buffer - not the source FBO
+            GL11.glReadPixels(swapchain.width() / 2, swapchain.height() / 2, 1, 1,
+                    GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px);
+            AuraLiteRenderMod.LOGGER.info("present: blit {}x{} -> default fb {} (FBO {}); "
+                            + "ctx game={} current={}; backbuffer center rgba=({},{},{},{})",
+                    swapchain.width(), swapchain.height(), tex, presentFbo,
+                    gameWindow == ctx ? "yes" : "NO", ctx,
+                    px.get(0) & 0xff, px.get(1) & 0xff, px.get(2) & 0xff, px.get(3) & 0xff);
+        }
     }
 
     /** Run a device-side action on the device context (hidden 4.6 or the game's). */
@@ -146,7 +210,6 @@ public final class RendererLoop {
 
     private static void init(int fbWidth, int fbHeight) {
         long gameWindow = MinecraftClient.getInstance().getWindow().getHandle();
-        hidden = null;   // re-created cleanly on retry
         pacer = new FramePacer(Double.parseDouble(System.getProperty("auralite.targetFps", "120")));
         labels = RenderDocLabels.fromProperties();
         frame = new FrameContext();
@@ -156,25 +219,33 @@ public final class RendererLoop {
             AuraLiteRenderMod.LOGGER.warn("pack watcher disabled: {}", e.getMessage());
             watcher = null;
         }
-        onDeviceContext(() -> {
+        // Try the game's own context first (4.6+ makes the hidden one redundant);
+        // otherwise stand the shared hidden context up BEFORE any device work.
+        try {
+            device = new GlDevice();
+            AuraLiteRenderMod.LOGGER.info("device on the game's GL context");
+        } catch (RuntimeException gameCtxRefused) {
+            AuraLiteRenderMod.LOGGER.info("game context refused ({}); falling back to a "
+                    + "hidden shared 4.6 context", gameCtxRefused.getMessage());
+            hidden = new HiddenGlContext(gameWindow);
+            hidden.makeCurrent();
             try {
-                device = new GlDevice();   // game context first: 4.6+ makes hidden redundant
-                AuraLiteRenderMod.LOGGER.info("device on the game's GL context");
-            } catch (RuntimeException gameCtxRefused) {
-                AuraLiteRenderMod.LOGGER.info("game context refused ({}); falling back to a "
-                        + "hidden shared 4.6 context", gameCtxRefused.getMessage());
-                hidden = new HiddenGlContext(gameWindow);
-                hidden.makeCurrent();
-                try {
-                    device = new GlDevice();
-                } finally {
-                    hidden.restore();
-                }
+                device = new GlDevice();
+            } finally {
+                hidden.restore();
             }
+        }
+        // Everything device-side (images, shader modules, pack compile) must run
+        // on the device context - the game context is 3.2 and cannot compile GLSL 460.
+        onDeviceContext(() -> {
             swapchain = new WindowSwapchain(device, fbWidth, fbHeight);
+            capture = new SceneCapture(device, fbWidth, fbHeight);
             reloadPack();
         });
         AuraLiteRenderMod.LOGGER.info("renderer ready: {} | {}", device.deviceName(), device.driverVersion());
+        AuraLiteRenderMod.LOGGER.info("present {} (F8 toggles the pack output, F9 cycles the debug view, "
+                + "Right Shift - status screen)",
+                presentEnabled ? "enabled" : "disabled; vanilla frame shows");
     }
 
     /** Wait for the GPU, drop pack-bound objects, load and rebuild. */
@@ -192,13 +263,29 @@ public final class RendererLoop {
             throw new IllegalStateException("pack refused:\n" + loader.report().receipt());
         }
         manifest = loader.manifest();
+        // Session-forced options survive reloads from disk (F9's DEBUG_VIEW
+        // must not snap back to the file's default on hot-reload).
+        for (java.util.Map.Entry<String, String> e : hostOptions.entrySet()) {
+            manifest.setOption(e.getKey(), e.getValue());
+        }
         pipelines = new GlPipelineProvider(device, manifest);
+        capture.resize(swapchain.width(), swapchain.height());
         RenderGraph rg = new PackGraphBuilder(manifest, pipelines)
                 .build(swapchain.width(), swapchain.height(), manifest.shadowMapResolution(),
                         new int[] { 23, 97, 23 });
         CompiledGraph fresh = rg.compile(swapchain.width(), swapchain.height(), device.limits());
         fresh.allocate(device);
         fresh.bindImported("backbuffer", swapchain.image());
+        // The scene resource is optional on purpose: a pack on disk that
+        // predates the capture (config/auralite-render/pack not yet updated
+        // from the kit) renders as before instead of refusing to start.
+        if (manifest.graph.findResource("scene") != null) {
+            fresh.bindImported("scene", capture.image());
+        } else {
+            AuraLiteRenderMod.LOGGER.warn("pack declares no 'scene' resource; "
+                    + "vanilla capture idle - update config/auralite-render/pack "
+                    + "from the kit's pack/ to see the world through the pack");
+        }
         if (graph != null) graph.release();
         graph = fresh;
         labels.compiled(graph);
@@ -217,12 +304,50 @@ public final class RendererLoop {
     /** Successful frames since process start (0 until the first one lands). */
     public static long framesRendered() { return frames; }
 
+    /** Whether the pack's output is blitted over the screen each frame. */
+    public static boolean presentEnabled() { return presentEnabled; }
+
+    /** GUI button: show the pack output / let Minecraft's frame through. */
+    public static void togglePresent() {
+        presentEnabled = !presentEnabled;
+        AuraLiteRenderMod.LOGGER.info("present {}", presentEnabled ? "enabled" : "disabled; vanilla frame shows");
+    }
+
+    /** The four DEBUG_VIEW values the reference pack's final stage knows. */
+    private static final String[] DEBUG_VIEWS = {"0", "1", "2", "3"};
+    private static final String[] DEBUG_VIEW_NAMES = {"scene", "luma", "rgb", "grid"};
+
+    /**
+     * F9: cycle the pack's const debug view and rebuild so the new value
+     * reaches the shader as a define. The capture keeps running either way;
+     * this only changes how the final stage displays it.
+     */
+    public static void cycleDebugView() {
+        if (failed || device == null) {
+            AuraLiteRenderMod.LOGGER.warn("debug view cycle with no live device; ignoring");
+            return;
+        }
+        debugViewIndex = (debugViewIndex + 1) % DEBUG_VIEWS.length;
+        String value = DEBUG_VIEWS[debugViewIndex];
+        hostOptions.put("DEBUG_VIEW", value);
+        try {
+            onDeviceContext(RendererLoop::rebuild);
+            AuraLiteRenderMod.LOGGER.info("debug view -> {} ({})", value, DEBUG_VIEW_NAMES[debugViewIndex]);
+        } catch (RuntimeException e) {
+            failed = true;
+            lastError = e.toString();
+            AuraLiteRenderMod.LOGGER.error("debug view rebuild failed; frames stop:", e);
+        }
+    }
+
     /** Last loop failure as a single line, or null when healthy. */
     public static String lastError() { return lastError; }
 
     /** Full restart from the screen button: close everything, arm a fresh attempt. */
     public static void retry() {
         shutdown();
+        stopped = false;
+        presentLogged = false;
         failed = false;
         lastError = null;
         AuraLiteRenderMod.LOGGER.info("renderer retry armed; the next frame re-creates the device");
@@ -245,6 +370,7 @@ public final class RendererLoop {
     }
 
     public static void shutdown() {
+        stopped = true;
         onDeviceContext(() -> {
             if (device == null) return;
             device.waitIdle();
@@ -259,6 +385,10 @@ public final class RendererLoop {
         if (swapchain != null) {
             onDeviceContext(swapchain::destroy);
             swapchain = null;
+        }
+        if (capture != null) {
+            onDeviceContext(capture::destroy);
+            capture = null;
         }
         if (watcher != null) watcher.close();
         if (source != null) source.close();
