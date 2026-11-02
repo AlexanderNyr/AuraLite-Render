@@ -31,6 +31,7 @@ import org.joml.Matrix4f;
 public final class FrameBridge {
 
     private static boolean receiptLogged;
+    private static boolean worldReceiptLogged;
 
     private FrameBridge() { }
 
@@ -105,6 +106,24 @@ public final class FrameBridge {
         }
 
         f.finishCameraUpdate();
+
+        // The first frame of a session is usually the main menu (no world,
+        // eye at origin): that receipt proves the projection chain, but the
+        // world fields need their own line the first time there IS a world.
+        if (!worldReceiptLogged && world != null && mcCamera != null) {
+            worldReceiptLogged = true;
+            Vec3d wEye = mcCamera.getPos();
+            AuraLiteRenderMod.LOGGER.info(
+                    "framectx/world: eye=({},{},{}) yaw={} pitch={} fov={} | time={} tod={} "
+                            + "day={} sun={} night={} moon={} weather={} wet={} dim={} rd={} "
+                            + "hideGui={} | proj[0]={} view[0]={} vp[0]={}",
+                    wEye.x, wEye.y, wEye.z,
+                    mcCamera.getYaw(), mcCamera.getPitch(), f.camera.fovDegrees,
+                    f.worldTime, world.getTimeOfDay(), f.worldDay,
+                    f.sunAngle, f.isNight, f.moonPhase, f.weather, f.wetness,
+                    f.dimension, f.renderDistanceChunks, f.hideGui,
+                    f.camera.projection[0], f.camera.modelView[0], f.viewProjection[0]);
+        }
 
         if (!receiptLogged && mcCamera != null) {
             receiptLogged = true;

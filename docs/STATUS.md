@@ -294,6 +294,25 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   not re-run for this phase (data-only fill, no GL/VK path touched);
   the in-game receipt to collect is the one-shot `framectx: ...` log
   line.
+- r24 receipts + world-line fix (2026-11-02): the framectx chain is
+  live on the GT 710 - the session's one-shot `framectx: eye=(0,0,0)
+  ... proj[0]=0.8033332 view[0]=-1.0 viewProjection[0]=-0.8033332`
+  printed on the first frame (main menu, no world: tod=-1 in that
+  line is the designed stale marker), and the numbers check out:
+  cot(35 deg) / (1280/720) = 0.8033 is exactly
+  perspective(fov 70, aspect), and vp = proj * view follows from it.
+  A menu line cannot prove the world fields, so the bridge now prints
+  a second one-shot `framectx/world:` at the first frame with a live
+  world - that receipt is owed next run. Host gate re-run on a second
+  machine (WSL2 Ubuntu 26.04, OpenJDK 21.0.12.1): `make test` 1084/0,
+  3 NC, 9/9 PASS - the doc numbers hold on hardware this repo does
+  not own. `make gpu-test` there: vk RENDERED byte-identical sha
+  90f1a0c4... but on llvmpipe (LLVM 21.1.8), gl REFUSED-NAMED
+  (llvmpipe caps at 4.5 where the backend needs 4.6; /dev/dri denied
+  under WSL) - the GT 710 is not visible inside WSL, so Phase 5's
+  discrete-card gate stays owed (native Windows, or a GPU-visible
+  WSL/Docker once the NVIDIA ICD is present). Gates for this fix:
+  `make test` 1084/0, 9/9; fabric jar rebuilt 448047 B.
 
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched
