@@ -313,6 +313,24 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   discrete-card gate stays owed (native Windows, or a GPU-visible
   WSL/Docker once the NVIDIA ICD is present). Gates for this fix:
   `make test` 1084/0, 9/9; fabric jar rebuilt 448047 B.
+- r25 run receipt (2026-11-02, GT 710, Prism/Win10): the world line
+  lands and checks out arithmetically - `framectx/world:
+  eye=(-23.592139869347488,136.85393295419917,73.35093515001122)
+  yaw=6.4507165 pitch=10.050014 fov=70.0 | time=67458 tod=4457
+  day=0 sun=0.18570833 night=false moon=0 weather=CLEAR wet=0.0
+  dim=OVERWORLD rd=12 | proj[0]=0.8033332 view[0]=-0.99366885
+  vp[0]=-0.7982472`: the eye is exactly the login position from the
+  same log, sun = 4457/24000 to the last digit, view[0] = cos(186.45
+  deg) = cos(yaw + 180), vp = proj * view follows. Session: menu line
+  first (tod=-1 stale marker by design), F9 through all four modes,
+  present receipt (214,214,214,255 luma readback), F2, shutdown
+  modules=0, exit 0. The frame-context phase closes under rule 4.
+  WSL re-run (fresh clone 453 objects): `make test` 1084/0 9/9 PASS
+  again; `make gpu-test` unchanged - vk RENDERED on llvmpipe with the
+  byte-identical sha 90f1a0c4..., gl REFUSED-NAMED (llvmpipe 4.5);
+  the discrete GT 710 still never appears inside WSL, Phase 5 stays
+  owed and is being moved to a native Windows runner (see the kit's
+  gpu-test-win lane).
 
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched
