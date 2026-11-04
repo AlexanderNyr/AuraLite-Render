@@ -19,4 +19,12 @@ public interface PipelineProvider {
 
     /** True when the pack supplies this program at all. */
     boolean has(String programName);
+
+    /**
+     * Drops every pipeline and shader module this provider created. Called on
+     * pack reload, resize and debug-view rebuilds: pipelines are pack- and
+     * size-bound. The no-op default keeps the host test providers (null
+     * device, no cache) interface-compatible.
+     */
+    default void invalidate() { }
 }

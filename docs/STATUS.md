@@ -7,7 +7,7 @@ Every number below is measured by `make test`, not estimated.
 
 ```
 rhi         51 passed   0 failed   0 NC   PASS
-graph       81 passed   0 failed   1 NC   PASS
+graph       90 passed   0 failed   1 NC   PASS
 uniform     91 passed   0 failed   0 NC   PASS
 biome      142 passed   0 failed   1 NC   PASS
 nulldev    115 passed   0 failed   0 NC   PASS
@@ -15,7 +15,7 @@ pack       165 passed   0 failed   0 NC   PASS
 tables     340 passed   0 failed   0 NC   PASS
 fabric      30 passed   0 failed   0 NC   PASS
 view         69 passed   0 failed   1 NC   PASS
-TOTAL 1084 passed, 0 failed, 3 negative controls, 9/9 suites green
+TOTAL 1093 passed, 0 failed, 3 negative controls, 9/9 suites green
 RESULT: PASS
 ```
 
@@ -331,6 +331,224 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   the discrete GT 710 still never appears inside WSL, Phase 5 stays
   owed and is being moved to a native Windows runner (see the kit's
   gpu-test-win lane).
+
+- Native Windows gate (2026-11-02, kit r28, gpu-test-win\run-gpu-test.bat,
+  LANE=vk, Adoptium 17): `GPU vk: RENDERED - 47 commands, 13 barriers,
+  6 passes, 0 violations (none raised), 1280x720 on "NVIDIA GeForce GT
+  710"; pixels sha256=90f1a0c49a1c4d5be3fb6f43bc60696b8d53c443b9f3e68cf24c8a63d3c6a3dd
+  nonzero=3686400/3686400; timestamps 1793647842679092256 <
+  1793647842681704480`, exit 0. The discrete GT 710 renders the smoke
+  frame in Vulkan and is validation-clean (0 violations; Khronos layer
+  absent on this host, VkDevice skipped it by name). The pixel sha is
+  byte-identical to the llvmpipe receipts from WSL and the sandbox
+  (90f1a0c4...) - cross-driver determinism of the smoke frame. Phase
+  5's discrete-geometry gate closes here. Kit tooling: packs/
+  AuraLite-Native shipped in the kit (repo-root requirement),
+  glslangValidator 16.6 in bin\ (SPIR-V), default lane vk - Windows
+  has no NVIDIA libEGL.dll, so the gl lane stays covered by WSL
+  (llvmpipe) and the game's WGL path.
+
+- Phase 4 VK-windowed, code landed (2026-11-03): `-Dauralite.backend=vk`
+  (or `AURALITE_BACKEND=vulkan`) runs the fabric loop on `VkDevice`
+  offscreen; GL stays the default lane. `VulkanPipelineProvider` compiles
+  the pack through glslangValidator (`-Dauralite.glslang`, then
+  `config/auralite-render/bin/`, then PATH) with the option defines in the
+  text hash; `SceneCapture` uploads the vanilla frame GL -> VK with no row
+  flip (both samplers read row 0 at v=0); present reads the VK backbuffer
+  back (`readImage`, device side) and uploads it into a preview GL texture
+  with a row flip (GL row 0 = screen bottom, VK row 0 = screen top - both
+  backends keep RHI top-left through their viewport flips), then the closed
+  GL blit and default-fb receipt run unchanged (rule 4 preserved). Host
+  gate `make test` 1084/0, 9/9; fabric lane `gradle remapJar` BUILD
+  SUCCESSFUL, jar 456,983 B. **NOT CLAIMED PRESENTED**: the windowed VK
+  frame still owes its GPU receipt - run the kit's jar with
+  `-Dauralite.backend=vk`, press F8, and file the present line plus the
+  orientation check (F9's scene view must read upright, same as the GL
+  lane); glslangValidator goes in `config/auralite-render/bin/` (copy
+  from the kit's `gpu-test-win/bin/`). Phase 4 stays open until that
+  receipt exists.
+
+- Phase 4 VK-windowed gate CLOSED (2026-11-03, kit r34, Prism/Win10,
+  GT 710, `-Dauralite.backend=vk`): the windowed VK frame landed with
+  its receipts. Startup chain: `device = Vulkan (NVIDIA GeForce GT 710)`
+  -> `pack loaded: AuraLite Native Reference ... 94245 us, 10 program
+  files` (glslangValidator lane) -> `renderer ready: NVIDIA GeForce
+  GT 710 | 475.56.0 | backend AuraLite-Render VK13`. F8: `present: blit
+  1280x720 -> default fb 61 (FBO 6); ctx game=yes current=...; backbuffer
+  center rgba=(140,174,199,0)` - sky at the operator's sight line, read
+  from the default framebuffer after the blit (rule 4). Orientation: the
+  r33 run is the first frame ever seen on this lane and it came out
+  upside down - the present upload's row flip was compensating a row
+  order the readback does not have (the "VK row 0 is the top" note in
+  the code-landed entry above was a pre-first-frame guess); the flip was
+  removed in kit r34, and the operator confirms the world reads upright
+  with present on, F9's luma/rgb/grid views upright, F2 screenshots
+  matching. Known defect filed as the next item: the process dies with
+  `0xC0000409` ~15 s after an F9 debug-view rebuild, with no `Stopping!`
+  line and no `hs_err_pid*.log` - the native fastfail lands outside the
+  JVM before CLIENT_STOPPING can run, so the r34 shutdown step receipts
+  (`begin`/`waitIdle ok`/`device closed`) never print. Host gates
+  unchanged: `make test` 1084/0, 9/9; `make gpu-test LANE=vk` RENDERED
+  sha 90f1a0c4... byte-stable; patch applies clean on a fresh clone of
+  26c7098 (APPLY-OK + 1084/0/9/9). Phase 4 closes here under rule 4.
+
+- VK-lane stability receipts (2026-11-03, kits r35-r37, GT 710): the r35
+  isolation run excluded F9 (never pressed) and pinned the crash to an AV
+  inside nvoglv64.dll (hs_err_pid9360.log, random timing); r36 replaced
+  the synchronous glGetTexImage with a two-PBO glReadPixels ring and
+  deferred the present readImage one frame - the crash did not come back
+  and the shutdown chain ran clean for the first time (`Stopping!` ->
+  `shutdown: begin` -> `waitIdle ok` -> receipt -> `device closed`,
+  exit 0). Two costs surfaced in that run: present FBO incomplete 0x8cd6
+  on the first F8 frame (the deferred readback means no pixels means no
+  texture storage; the loop died and the operator saw 100 fps of vanilla
+  with the module stopped), and F8-off stayed at 25 fps - the scene
+  upload's synchronous one-shot waited for the previous frame's pack
+  every frame. r37 fixes both: VkDevice one-shots are fence-ringed (an
+  upload submits and never waits; the oldest fence is retired before the
+  next submit and sits ahead of the pack, so that wait is instant;
+  staging dies with its fence; waitIdle/close drain the ring), and the
+  preview texture allocates storage up front while present blits only
+  after everFilled - the vanilla frame shows until real pixels arrive.
+  Host gates: `make test` 1084/0, 9/9; `make gpu-test LANE=vk` RENDERED
+  sha 90f1a0c4... byte-stable through the async change. The r37 Windows
+  run then landed the F8-off baseline at 45 fps (the upload wait is
+  gone) and, with F8 on, reproduced the nvoglv64 AV after ~35 s of
+  gameplay - hs_err_pid9540.log pinned it precisely: the Render thread
+  died inside `glTexImage2D` called from `WindowSwapchain.colorTexture()
+  +308` (pc nvoglv64.dll+0xea6ff0, the same PC as r35, code
+  0xC0000409), i.e. the per-frame preview upload, not the blit and not
+  the PBO ring. r38 changes that call: storage for the extent already
+  exists, so pixels now land via glTexSubImage2D (no per-frame texture
+  reallocation inside driver 475.56.0), from one reused scratch buffer
+  (no fresh 3.6 MB memAlloc per frame), with GL_UNPACK_ROW_LENGTH /
+  SKIP_* pinned to 0 in case vanilla left them set - any of which could
+  otherwise make the driver read past the buffer. F8-off 45 fps and the
+  r37 gpu-test receipts stand. The r38 Windows run: four minutes of F8
+  gameplay with no crash and a clean exit 0 (shutdown chain intact),
+  fewer freezes at 15-20 fps with F8 on - then a second run hit the
+  same 0xC0000409 AV after F9 cycling, and the operator could not
+  locate hs_err_pid12056.log (Prism writes it to the instance
+  directory, one level above minecraft\); the crash stays open pending
+  that file. The same run exposed a separate defect: F9 logged
+  `debug view -> N` but the screen never changed, on-screen and in the
+  F2 screenshots alike. Root cause (r39): the Vulkan lane compiled
+  SpirvCompiler's raw `src.text()` while only the GL lane went through
+  `ShaderSource.preprocessed()` - the pack's option defines physically
+  live there - so `#if DEBUG_VIEW == 1` saw an undefined identifier
+  (GLSL evaluates that to 0) and always took the scene branch; the
+  compile cache key was `text().hashCode()`, which ignores defines.
+  r39 compiles preprocessed(), keys the cache on the full source hash
+  (defines included), and logs `pack defines: ...` on every reload so
+  the option lane's receipt is in the log itself.
+
+  r39 was verified on the GT 710: the log shows
+  `pack defines: ... #define DEBUG_VIEW 1` after F9 and screenshot
+  2026-11-04_10.01.56.png is the grey luma world - the debug view
+  reaches pixels, F9 is closed. The same run crashed again
+  (0xC0000409, ~40 s after present enabled with two debug-view
+  reloads), and, like the r38 run 2, left no hs_err anywhere on the
+  machine - the only hs_err files present are the older r35-r37 ones.
+  A crash that leaves no dump cannot be diagnosed from the outside, so
+  r40 makes the run describe its own death: every reload logs its
+  stage (source, parsed, pipelines, compiled, allocated, releasing the
+  old graph, done), the loop records the stage and the frame count per
+  frame and logs a heartbeat every 600 frames with the GL state a
+  faulting driver trips over (first error, PIXEL_PACK/UNPACK buffer
+  bindings, draw/read FBO, bound texture), and a shutdown hook - the
+  one thing that runs whenever the process dies, hs_err or not -
+  writes `auralite-crash.txt` next to the game log with the last
+  stage, the device counters and every thread's stack. Nothing in r40
+  changes rendering: the gates are unchanged (gpu-test vk pixels sha
+  90f1a0c4 byte-identical), it only makes the next crash report
+  The r40 run (10:54-10:58) delivered the receipts and moved the
+  diagnosis: F9 is confirmed on hardware for all four views (luma grey,
+  rgb red channel, grid lines, scene), and the crash is NOT tied to a
+  debug view - it is tied to the NUMBER of rebuilds. Runs: no rebuild,
+  four minutes, clean exit; two rebuilds, crash; four rebuilds, crash.
+  The r40 run's last line is `debug view -> 0 (scene)` at 10:57:17 and
+  then sixty seconds of complete silence - no heartbeat (which fires
+  every 600 frames at ~16-20 fps), no shutdown log, no crash hook, no
+  hs_err. Silence in the log as well as on disk means the process was
+  killed from outside the JVM, which is exactly what 0xC0000409 from a
+  display-driver fault looks like, and it explains both missing files:
+  the hook never ran and log4j's tail died with the process. So r41
+  writes an unbuffered trace straight to `auralite-trace.txt` (open,
+  write, close - nothing to lose on a hard kill): every rebuild stage,
+  the first three frames after each rebuild, and the frame counter
+  every 20 frames. It also logs the device's live object counts after
+  every rebuild, which is the leak receipt for the real backend, and
+  GraphSuite gained a rebuild-cycle gate: four allocate/execute/release
+  rounds on the pack's own graph shape must return the device to the
+  same live image and buffer counts, so an internal leak is now a test
+  failure rather than a driver fault. Rendering is unchanged
+  (gpu-test vk sha 90f1a0c4).
+
+  r42 is the fix that trace pointed at. The r41 run's auralite-trace.txt
+  ends mid-run - `frame after rebuild 2`, the last line, three
+  milliseconds after `frame after rebuild 1` - so the process did not
+  die inside a rebuild and not while idle: it died on the third frame
+  after a rebuild, exactly like the r37-r41 runs. That is the signature
+  of a use-after-free, not of a bad call: the frames after a rebuild
+  are the first ones to draw through the new graph's framebuffers while
+  the previous graph's attachments were just freed. The Vulkan backend
+  was doing precisely that: releasing a graph closed its images, but
+  the framebuffers and image views cached in VkDevice outlived them -
+  nothing in the backend ever destroyed a framebuffer (the lists exist
+  and are only cleared in close()). A framebuffer pins the attachment
+  views, and a view pins its image, so every rebuild left framebuffers
+  referencing freed images, and the first draw through a stale one is
+  the driver fault the GT 710 reports as 0xC0000409 - two or three
+  frames later, with no Vulkan error and no Java exception. The count
+  is stable because the caches are keyed by hashes that include the
+  image handle: a stale entry is never hit, it just keeps a dangling
+  view alive. r42 makes image teardown drop the caches first, scoped to
+  images that actually have attachment views (staging images for
+  readback keep the per-frame path untouched), and never destroys a
+  view another live image still uses. Two receipts were added: the
+  rebuild log now carries `fbos= viewOwners= invalidations=`, and
+  GpuSmoke replays the host's rebuild sequence (compile, frame,
+  release the old graph, frame) on the real backend with validation on.
+  Honest limit, measured: the gate does NOT fail without the fix on
+  lavapipe - that driver refcounts image views itself and survives the
+  same sequence, so the gate proves the path works and would catch a
+  gpu-side validation error, but the fault itself is Windows-driver
+  specific and only the GPU run can close it.
+
+  r42 run, GT 710, Windows 10, driver 475.56.0, VK13 - THE CRASH IS
+  CLOSED. Ten minutes with present on, eighty rebuilds, and a clean
+  exit 0 (shutdown: waitIdle ok -> labels receipt -> device closed).
+  The run covers every shape that used to kill the process: single F9
+  steps with minutes in between (15:57:36 luma, 15:58:52 rgb, 16:00:52
+  grid, 16:03:10 scene - each survived, where the pre-r42 run died on
+  the second), the all-four-views burst at 16:04:00 (four rebuilds in
+  under a second, repeated four times), and present toggled off and on
+  mid-run (16:03:36 / 16:03:46). The receipts carry the fix itself:
+  every teardown that had attachment views reports
+  `invalidations=1` and the framebuffer count stays 0, so the stale
+  framebuffers that used to pin freed images no longer exist at all.
+  The first rebuild after a pack whose attachments were never torn
+  down shows `viewOwners=0 invalidations=0`, and every later one shows
+  `viewOwners=1 invalidations=1` - exactly the before/after of the
+  fix. Note for the record: the 16:04:00 burst produced
+  `root.updateDisplay`-era frame-time warnings (100-550 ms) because
+  four whole graphs were compiled inside one second - that is the cost
+  of a dev keystroke, not a steady-state number. All four debug views
+  are on screen in that run's screenshots (luma grey, rgb red, grid
+  overlay, scene), and `make drift-check` now passes with the suite
+  numbers moved to 1093/graph 90.
+
+  One wrinkle worth recording: `drift-check` compares the suite receipts
+  against `docs/STATUS.md` AND `README.md`, and the update patch
+  deliberately does not carry `README.md` (the standing rule: the patch
+  is fabric/core/packs/tests/docs only, README stays out). So a fresh
+  clone with the patch applied passes `make test` 1093/0 but still
+  fails `drift-check` on the README lines - by construction, not by
+  drift. Clone verification therefore stays `make test` (the protocol
+  every earlier revision used), while `drift-check` is a repository
+  gate: it is green here, where README.md lives. Moving README's three
+  number lines in a patch would fix the clone case and break the rule;
+  that call belongs to the operator, not to this revision.
 
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched

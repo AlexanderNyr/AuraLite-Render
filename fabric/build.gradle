@@ -46,6 +46,21 @@ def strippedLwjgl = ['lwjgl', 'lwjgl-opengl', 'lwjgl-vulkan'].collect {
     new File(lwjglStrippedDir, "${it}-stripped.jar")
 }
 
+// The game ships LWJGL 3.3.3 without the Vulkan module (vanilla is GL-only),
+// so `new VkDevice()` dies with NoClassDefFoundError on
+// org/lwjgl/vulkan/VkDebugUtilsMessengerCallbackEXTI unless the classes ride
+// along. Shade the vulkan module INTO THE GAME'S VERSION (3.3.3), not the
+// compile-time 3.4.3: a 3.4.3 vulkan class reaches org/lwjgl/system/
+// Callback$Descriptor, which does not exist in the game's 3.3.3 core (first
+// r31 crash). The module has no native side of its own (it calls the system
+// vulkan-1.dll through the game's lwjgl.dll), so classes alone are the
+// integration; META-INF (multi-release module-info) is excluded.
+jar {
+    from({ zipTree('../third_party/lwjgl-vulkan-3.3.3.jar') }) {
+        exclude 'META-INF/**'
+    }
+}
+
 dependencies {
     minecraft "com.mojang:minecraft:${project.minecraft_version}"
     mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"

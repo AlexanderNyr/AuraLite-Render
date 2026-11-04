@@ -365,6 +365,53 @@ public final class GraphSuite {
         backbuffer.close();
         device.close();
 
+        section("rebuild cycle leaks nothing (r41)");
+        // The GT 710 runs die after a handful of debug-view rebuilds, not
+        // during the first frame (r37-r39 receipts: every crash came after
+        // 2-4 reloadPack calls; the run with no rebuilds survived four
+        // minutes). The sample frame is the pack's shape, so replaying the
+        // host's rebuild sequence on it must return the device to the exact
+        // same live counts every time - if a rebuild leaks an image or a
+        // buffer, these numbers creep and the driver eventually trips over
+        // the exhaustion instead of reporting it.
+        NullDevice cycle = new NullDevice();
+        GfxImage cycleImport = cycle.createImage(GfxDesc.Image.tex2d(W, H, GfxFormat.RGBA8_UNORM,
+                GfxUsage.IMAGE_COLOR_ATTACHMENT | GfxUsage.IMAGE_PRESENT).named("scene"));
+        int baseImages = cycle.liveImageCount();
+        int baseBuffers = cycle.liveBufferCount();
+        int[] imagesPerRebuild = new int[4];
+        int[] buffersPerRebuild = new int[4];
+        for (int i = 0; i < 4; i++) {
+            CompiledGraph round = sampleFrame().compile(W, H, cycle.limits());
+            round.allocate(cycle);
+            round.bindImported("backbuffer", cycleImport);
+            RecordingCommandBuffer rcb =
+                    (RecordingCommandBuffer) cycle.createCommandBuffer(QueueType.GRAPHICS);
+            rcb.begin();
+            round.execute(new GraphContext(cycle, rcb, round, new FrameContext()));
+            rcb.end();
+            cycle.submit(QueueType.GRAPHICS, rcb);
+            imagesPerRebuild[i] = cycle.liveImageCount();
+            buffersPerRebuild[i] = cycle.liveBufferCount();
+            round.release();
+        }
+        receipt("rebuild cycle: images=" + java.util.Arrays.toString(imagesPerRebuild)
+                + " buffers=" + java.util.Arrays.toString(buffersPerRebuild)
+                + " base=" + baseImages + "/" + baseBuffers);
+        eq(cycle.liveImageCount(), baseImages,
+                "four rebuild cycles return the image count to where it started");
+        eq(cycle.liveBufferCount(), baseBuffers,
+                "four rebuild cycles return the buffer count to where it started");
+        for (int i = 1; i < imagesPerRebuild.length; i++) {
+            eq(imagesPerRebuild[i], imagesPerRebuild[0],
+                    "rebuild " + (i + 1) + " peaks at the same image count as rebuild 1");
+            eq(buffersPerRebuild[i], buffersPerRebuild[0],
+                    "rebuild " + (i + 1) + " peaks at the same buffer count as rebuild 1");
+        }
+        eq(cycle.violations().size(), 0, "the rebuild cycles recorded no contract violations");
+        cycleImport.close();
+        cycle.close();
+
         section("unbound imports are refused");
         throwsNamed(new Runnable() { @Override public void run() {
             CompiledGraph fresh = sampleFrame().compile(W, H);

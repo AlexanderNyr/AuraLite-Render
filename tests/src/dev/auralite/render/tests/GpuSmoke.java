@@ -361,6 +361,54 @@ public final class GpuSmoke {
                         + java.util.Arrays.toString(ts));
             }
         }
+        // Rebuild replay gate (r42). The Windows crashes happen two or three
+        // frames AFTER a rebuild, on the first draw that follows - and the
+        // cause is that the previous graph was released with its cached
+        // framebuffers still alive: a framebuffer pins the attachment views,
+        // which pin the image, so freeing an image under them is undefined
+        // behaviour the driver answers with 0xC0000409 much later. Replaying
+        // the host's rebuild sequence here keeps that hazard under a gate: a
+        // fresh compile, one executed frame, the old graph released, another
+        // frame - on the real backend, with validation on.
+        for (int round = 0; round < 2; round++) {
+            CompiledGraph next = graph.compile(WIDTH, HEIGHT, dev.limits());
+            next.allocate(dev);
+            next.bindImported("backbuffer", backbuffer);
+            GfxImage sceneAgain = null;
+            if (manifest.graph.findResource("scene") != null) {
+                sceneAgain = dev.createImage(GfxDesc.Image.tex2d(WIDTH, HEIGHT,
+                        GfxFormat.RGBA8_UNORM, GfxUsage.IMAGE_STORAGE | GfxUsage.IMAGE_SAMPLED
+                                | GfxUsage.IMAGE_COLOR_ATTACHMENT).named("scene"));
+                next.bindImported("scene", sceneAgain);
+                // Same fill as the first frame: the present pass copies the
+                // scene through, so an empty scene means an empty frame and
+                // the check below would be meaningless.
+                java.nio.ByteBuffer fill = java.nio.ByteBuffer.allocateDirect(WIDTH * HEIGHT * 4);
+                while (fill.hasRemaining()) fill.put((byte) 0x40);
+                fill.flip();
+                dev.uploadImage(sceneAgain, 0, fill);
+            }
+            dev.beginFrame();
+            GfxCommandBuffer rcb = dev.createCommandBuffer(QueueType.GRAPHICS);
+            rcb.begin();
+            next.execute(new GraphContext(dev, rcb, next, new FrameContext()));
+            rcb.end();
+            dev.submit(QueueType.GRAPHICS, rcb);
+            dev.waitIdle();
+            dev.endFrame();
+            byte[] again = dev.readImage(backbuffer);
+            int non = 0;
+            for (byte b : again) if (b != 0) non++;
+            if (again.length == 0 || non == 0) {
+                throw new GfxException("gpu smoke: rebuild replay " + (round + 1)
+                        + " produced an empty frame");
+            }
+            // Release the previous graph BEFORE the next one is compiled, the
+            // same order reloadPack uses on the host.
+            compiled.release();
+            if (sceneAgain != null) sceneAgain.close();
+            compiled = next;
+        }
         String receipt = cmd.commandCount() + " commands, " + compiled.totalBarriers()
                 + " barriers, " + compiled.passOrder().size() + " passes, 0 violations (none raised), "
                 + WIDTH + "x" + HEIGHT + " on \"" + dev.deviceName() + "\""
