@@ -550,6 +550,40 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   number lines in a patch would fix the clone case and break the rule;
   that call belongs to the operator, not to this revision.
 
+  r44 closes the paperwork the crash had been blocking, and starts Phase 6
+  the only way the roadmap allows - with a document, not code.
+  THREE things moved:
+  (1) ROADMAP: Phase 4 and Phase 5 are marked closed with their receipts
+  instead of the stale "PENDING" / "Open" paragraphs. Phase 4's closing
+  receipt is the windowed frame on the GT 710 (the pack's own pixels read
+  back from the default framebuffer before the swap, `rgba=(128,128,0,255)`
+  then the world's `(161,202,223,0)`, present toggled by F8, shutdown exit
+  0); Phase 5's is the vk lane rendering with a byte-stable hash plus the
+  three later defects it took to make that lane survive a real session.
+  (2) BIG_PLAN's gate table no longer claims "a discrete NVIDIA/AMD card
+  remains owed": the same pack runs inside Minecraft on a GT 710 over VK13
+  through 80 rebuilds with exit 0, which is that bar, and the row now says
+  so with the receipt attached.
+  (3) NEW `docs/plans/BIOME_PLAN.md` - the plan doc Phase 6 requires before
+  any B5 code exists. It states the seam problem exactly (one cell = 4
+  blocks is structural, not a knob, and the removed `blendRadius` control is
+  cited rather than re-litigated), records what already exists so the work
+  is scoped honestly (the field, the builder, both packer layouts, the LUT,
+  and a compute pass in the reference pack that already has the plumbing),
+  chooses the design that makes the seam cheap (blur the *baked volume* in
+  compute, sample one texel instead of eight - wider seam for fewer
+  fetches), names four refusals before any code (`BIOME_SEAM_R_TOO_WIDE`,
+  `BIOME_VOLUME_IDS_OVER_TOPK`, `BIOME_VOLUME_STALE` with the note that a
+  stale seam looks plausible and must therefore be loud, and "unknown cells
+  stay unknown"), and lists five NULL-backend gates including the one that
+  keeps the widening honest: at R = 0 the GPU rule must reproduce the CPU
+  sampler exactly. It also refuses four things outright (a wider CPU kernel,
+  anisotropic widths, baking the blur to disk, touching the legacy lane).
+  Phase 6 stays "planned, not started" and B5 stays uncoded until gate 1 is
+  green - the roadmap's rule, kept.
+  Gates after the doc work: `make test` 1093/0 9/9, `make drift-check`
+  PASS.
+
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched
 by `make deps` (~11 MB); they are compile-only and never committed.

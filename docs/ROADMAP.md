@@ -49,7 +49,7 @@ Closing patch: `patches/phase-3-native-reference-pack.patch` — replayed gate
 985/0, 7/7; a from-nothing replay of all four patches rebuilds this tree
 byte-identically (verified 2026-10-31).
 
-## Phase 4 — fabric glue (sandbox deliverable landed; windowed-frame gate PENDING)
+## Phase 4 — fabric glue (closed)
 
 Java 21 + Gradle/Loom sources under `fabric/`: window swapchain, frame
 pacing, pack hot-reload, RenderDoc-friendly labelling. The sandbox now HAS
@@ -69,12 +69,18 @@ frame on each backend, presented — still PENDING.
 - **Build-proven this session**: `gradle build` rc=0 on OpenJDK 21.0.13
   (loom 1.8.13 had produced a manifest-only remapJar under Gradle 8.12 —
   fixed by loom 1.10.5 + pinning remapJar's input to the jar task archive).
-- **NOT landed, NOT claimed**: a presented windowed frame. The JDK 21 lane
-  exists now; what remains is the windowed presentation itself on a GPU.
-  Per standing rule 4 this phase stays open and gets no closing patch until
-  that frame exists.
+- **Closed on hardware (rule 4 satisfied)**: the windowed frame is presented
+  on a discrete card - NVIDIA GT 710, driver 475.14, Windows 10, Prism,
+  Minecraft 1.21.1. The present receipt reads the pack's own pixels back from
+  the DEFAULT framebuffer before the swap (`rgba=(128,128,0,255)` - the
+  reference final's gradient centre), the operator's screenshot shows that
+  gradient filling the window, and later revisions receipt the world instead
+  of a gradient (`rgba=(161,202,223,0)` on a bright sky pixel, with the pack's
+  terrain under it). Present is OFF by default and toggled with F8; the
+  shutdown chain closes with `waitIdle ok -> device closed -> exit 0`.
+  Closing patch: `patches/phase-4-fabric-glue.patch` (the 26c7098 export).
 
-## Phase 5 — GPU behaviour gates
+## Phase 5 — GPU behaviour gates (closed)
 
 Where a GPU exists: triangle receipts (hash of first presented frame per
 backend), barrier validation clean under Vulkan validation layers and the
@@ -91,14 +97,30 @@ Gate: `make gpu-test` green on one discrete NVIDIA/AMD card.
   Location 0 not wired into pVertexInputState; storage-image descriptors
   missing from the pipeline layout) and the driver aborted on the invalid
   layout — `make gpu-test` exits 1, honestly RED. Receipts in STATUS.
-- **Open**: fix both named VK findings, get a real RENDERED frame (hash),
-  then close on one discrete NVIDIA/AMD card.
+- **Closed on one discrete card**: both findings were fixed (descriptor
+  bridge, pass-compatible pipeline creation), the vk lane renders with a
+  byte-stable pixel hash and monotonic timestamps, and the whole thing runs
+  on a real GT 710 inside Minecraft. Later revisions added: the option
+  defines reaching the VK compile lane (F9 was silently ignored), a
+  use-after-free on graph rebuilds (framebuffers outliving their images),
+  and the receipts that make both visible in the log.
+  Closing patch: `patches/phase-5-gpu-behaviour-gates.patch`.
 
-## Phase 6 — widening (explicitly not started)
+## Phase 6 — widening (planned, not started)
 
-BIOME_PLAN B5 (blend radius beyond one 4-block cell), task/mesh lanes in GL
-via NV extensions, ray-query in shaders, bindless descriptor indexing.
-Each gets its own plan doc before any code. The seam stays one cell until B5.
+Each item gets its own plan doc **before** any code; none has code today, and
+none gets code before its doc exists.
+
+| Item | Plan doc | State |
+|---|---|---|
+| B5 — biome seam wider than one 4-block cell | `docs/plans/BIOME_PLAN.md` | written 2026-11-04: blur the baked volume in the compute lane, keep `ID_R32UI` exact, name the four refusals (`R_TOO_WIDE`, `IDS_OVER_TOPK`, `VOLUME_STALE`, unknown stays unknown), five NULL-backend gates |
+| ray-query in shaders | owed | the backend already enables the feature when the driver offers it and reports it as an optional capability (`RAY_QUERY` in every pack-load receipt); no shader uses it yet |
+| task/mesh lanes in GL via NV extensions | owed | backend-vulkan enables mesh features when offered; GL has no lane |
+| bindless descriptor indexing | owed | not started; the bridge currently packs `set*16+binding` into GL binding units |
+
+The seam stays one cell until BIOME_PLAN's gate 1 (equivalence at R = 0) is
+green — that gate exists precisely so the widening cannot drift from the CPU
+rule it replaces.
 
 ## Non-goals
 

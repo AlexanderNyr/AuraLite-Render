@@ -54,7 +54,7 @@ Three layers, bottom up:
 | Perf | `make bench` | graph + biome + uniform gates, 5×, no timing in receipts |
 | Lint | `packlint` | exit non-zero on error, `--strict` promotes warnings |
 | Drift | `drift-check` | suite numbers may not move without their doc lines |
-| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps — software host GREEN, all three in the receipts: vk + gl RENDERED, 46 commands / 13 barriers / 6 passes each, byte-stable pixel sha256, strictly increasing GPU timestamps, zero validation lines with the banner on, exit 0 (GL through zink with `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink`); a discrete NVIDIA/AMD card remains owed |
+| GPU | `make gpu-test` | first-frame hashes, validation-clean, monotonic timestamps — software host GREEN (vk + gl RENDERED, 47 commands / 13 barriers / 6 passes, byte-stable pixel sha256 `90f1a0c4…`, strictly increasing GPU timestamps, zero validation lines, exit 0; GL through zink with `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink`), **and the discrete bar is met**: the same pack runs inside Minecraft on an NVIDIA GT 710 (driver 475.56) over VK13, presenting world pixels (`rgba=(161,202,223,0)`) through 80 graph rebuilds and exiting 0 — see the GPU-run receipts in STATUS |
 | Parity | legacy suite | AuraLite-Shaders pixels match the reference loader |
 
 ## What is deliberately not in the plan
@@ -64,3 +64,8 @@ bindless indexing, a material system, an editor, GL < 4.6, Vulkan < 1.3.
 Each has its paragraph in the roadmap's Phase 6 or non-goals; none has code,
 and none gets code before it gets a plan doc. The fastest way to kill this
 project is a second feature before the first gate.
+
+B5 is the exception that proves the rule: its plan doc exists
+(`docs/plans/BIOME_PLAN.md`, 2026-11-04) and it still has no code, because the
+plan's own first gate is an equivalence proof against the CPU sampler - the
+same "receipt before feature" discipline every closed phase above followed.
