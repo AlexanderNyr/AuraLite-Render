@@ -68,6 +68,32 @@ public final class FrameContext {
     /** Exists only so the capability set has an honest, non-magic declaration. */
     private enum Placeholder { UNUSED }
 
+    /**
+     * Volumes a pass writes this frame, keyed by graph resource name. The host
+     * registers the object that owns the bake; the pass body asks for it and
+     * the reader gate refuses a stale one. Empty for every pack that does not
+     * declare a widened seam, which is why nothing else in the frame pays for
+     * this.
+     */
+    public final java.util.Map<String, dev.auralite.render.biome.BiomeSeamVolume> biomeVolumes =
+            new java.util.HashMap<String, dev.auralite.render.biome.BiomeSeamVolume>();
+
+    /** Registers (or replaces) the widened seam a resource holds this frame. */
+    public FrameContext bindBiomeVolume(String resourceName,
+                                        dev.auralite.render.biome.BiomeSeamVolume volume) {
+        if (resourceName == null || resourceName.isEmpty()) {
+            throw new IllegalArgumentException("a biome volume needs the resource name it fills");
+        }
+        if (volume == null) biomeVolumes.remove(resourceName);
+        else biomeVolumes.put(resourceName, volume);
+        return this;
+    }
+
+    /** The widened seam behind a resource, or null when the host bound none. */
+    public dev.auralite.render.biome.BiomeSeamVolume biomeVolume(String resourceName) {
+        return biomeVolumes.get(resourceName);
+    }
+
     public long frameId() { return frameId; }
     public float frameTimeSeconds() { return frameTimeSeconds; }
     public float frameDeltaSeconds() { return frameTimeDeltaSeconds; }

@@ -12,6 +12,8 @@ import dev.auralite.render.uniform.FunctionTable;
 import dev.auralite.render.uniform.Value;
 
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Collections;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -34,6 +36,11 @@ public final class PackGraphBuilder {
 
     private final PackManifest manifest;
     private final PipelineProvider pipelines;
+    // The frame extents of the build in progress: only the dispatch-base
+    // resolution needs them after the resource loop has run.
+    private int lastWidth = 1, lastHeight = 1;
+    private int[] lastBiomeCells;
+    private int lastShadowSize;
 
     public PackGraphBuilder(PackManifest manifest, PipelineProvider pipelines) {
         this.manifest = manifest;
@@ -51,6 +58,10 @@ public final class PackGraphBuilder {
 
     // ----------------------------------------------------------------- native
     public RenderGraph buildNative(int width, int height, int shadowMapSize, int[] biomeCells) {
+        lastWidth = width;
+        lastHeight = height;
+        lastShadowSize = shadowMapSize;
+        lastBiomeCells = biomeCells;
         RenderGraph g = new RenderGraph("native:" + manifest.name);
         this.activeGraph = g;
         GraphSpec spec = manifest.graph;
@@ -71,6 +82,24 @@ public final class PackGraphBuilder {
             else g.addTexture(r.name, d);
         }
 
+        // A history resource is a DOUBLE BUFFER: the graph keeps two resources
+        // (`taa.0`, `taa.1`) and swaps the IMAGES behind them once per frame, so
+        // the resource a pass writes keeps its NAME forever while the buffers
+        // alternate. Resolving a shader's `taa_cur` against the current phase at
+        // BIND time therefore answers with the other frame's side - which read
+        // as "the final pass sampled an empty buffer while the drawn one sat
+        // next to it". The answer the passes themselves used was fixed here, at
+        // build time, so the shader binds must use that same answer.
+        this.historyAtBuild = new HashMap<String, String>();
+        for (dev.auralite.render.graph.GraphHistory h : g.histories()) {
+            String log = h.logicalName();
+            historyAtBuild.put(log + ".cur", h.currentName());
+            historyAtBuild.put(log + "_cur", h.currentName());
+            historyAtBuild.put(log + ".prev", h.previousName());
+            historyAtBuild.put(log + "_prev", h.previousName());
+            historyAtBuild.put(log, h.currentName());
+        }
+
         ExprEnv env = new ExprEnv(new FunctionTable());
         for (GraphSpec.PassSpec p : spec.passes()) {
             PassType type = p.isCompute() ? PassType.COMPUTE : (p.isCopy() ? PassType.COPY : PassType.RASTER);
@@ -88,7 +117,7 @@ public final class PackGraphBuilder {
                 else b.write(name, Access.TRANSFER_WRITE);
             }
             if (p.isCompute()) {
-                int[] d = resolveDispatch(p, env, width, height);
+                int[] d = resolveDispatch(p, env, width, height, dispatchBase(p));
                 b.dispatch(d[0], d[1], d[2]);
             }
             if (!p.when.isEmpty()) {
@@ -98,8 +127,32 @@ public final class PackGraphBuilder {
 
             final String programName = p.program;
             final boolean compute = p.isCompute();
+            // The widened seam's freshness gate, wired where the plan said it
+            // belongs: a pass that READS the volume refuses a stale one by name
+            // before recording a single command. A pack that declares no volume
+            // is untouched.
+            //
+            // What this deliberately does NOT do is mark the volume current when
+            // the producer pass dispatches. A dispatch is not proof of a bake:
+            // whether the GPU's copy was rebuilt from the field the CPU currently
+            // holds depends on the host's upload, which happens outside the graph
+            // and outside this file. Marking on dispatch would let the gate certify
+            // itself, which is the one failure mode worth designing against. The
+            // record belongs to whoever actually baked (BiomeSeamVolume.bake), and
+            // the graph's job is only to refuse to read past it.
+            final String seamRead = biomeVolumeReadBy(p);
             b.body(new dev.auralite.render.graph.GraphPass.Executor() {
                 @Override public void execute(dev.auralite.render.graph.GraphContext ctx) {
+                    if (seamRead != null) {
+                        dev.auralite.render.biome.BiomeSeamVolume vol =
+                                ctx.frame() == null ? null : ctx.frame().biomeVolume(seamRead);
+                        if (vol != null) {
+                            // BIOME_VOLUME_STALE, thrown before a single
+                            // command is recorded: a stale seam looks
+                            // plausible, so it must not reach the screen.
+                            vol.freshness().checkFresh(ctx.currentPass().name());
+                        }
+                    }
                     if (programName.isEmpty() || pipelines == null) return;
                     // The graph opens and closes the render pass around this
                     // body and sets the viewport to that pass's own area, so all
@@ -153,19 +206,49 @@ public final class PackGraphBuilder {
                 set = new dev.auralite.render.rhi.GfxDescriptorSet(d.set);
                 sets.put(d.set, set);
             }
+            // A history resource is a double buffer in the graph (`taa.0`/`taa.1`)
+            // but the shader names the logical one (`taa_cur`). Resolving here
+            // is the same rule the pass declaration follows, so a stage and a
+            // `read=` line cannot disagree about which side they mean.
+            String resolved = historyAtBuild != null && historyAtBuild.containsKey(d.name)
+                    ? historyAtBuild.get(d.name)
+                    : resolveHistoryName(d.name, ctx.graph().graph());
             if (d.kind == dev.auralite.render.rhi.GfxDesc.PipelineLayout.Kind.STORAGE_IMAGE) {
                 set.add(dev.auralite.render.rhi.GfxDescriptorSet.Write.storageImage(
-                        d.binding, ctx.image(d.name)));
+                        d.binding, ctx.image(resolved)));
             } else {
-                throw new dev.auralite.render.rhi.GfxException("pack program '" + programName
-                        + "': combined sampler '" + d.name + "' binds by resource name too, but"
-                        + " the graph's descriptor bridge wires storage images only (yet)");
+                // A pack that wants to SAMPLE an image declares a sampler/texture
+                // and binds by resource name, the same way a storage image does.
+                // This used to throw: the bridge wired storage images only, so a
+                // pass like the reference pack's `terrain` - declared
+                // `read=biome_volume` since step 2 - could not read a texel of it
+                // even if its shader had asked. A sampler is a property of the
+                // READ, not of the resource, so it is created here and filtered
+                // NEAREST: hardware filtering would interpolate packed id bytes,
+                // and the average of two ids is a third id.
+                set.add(dev.auralite.render.rhi.GfxDescriptorSet.Write.sampler(
+                        d.binding, ctx.image(resolved), samplerNearest(ctx.device())));
             }
         }
         for (dev.auralite.render.rhi.GfxDescriptorSet set : sets.values()) {
             ctx.cmd().bindDescriptorSet(set.setIndex(), set);
         }
     }
+
+    /** One nearest-clamp sampler per device, shared by every sampled read. */
+    private dev.auralite.render.rhi.GfxSampler samplerNearest(
+            dev.auralite.render.rhi.GfxDevice device) {
+        if (nearestSampler == null) {
+            nearestSampler = device.createSampler(dev.auralite.render.rhi.GfxDesc.Sampler
+                    .nearestClamp().named("pack-sampled-nearest"));
+        }
+        return nearestSampler;
+    }
+
+    private dev.auralite.render.rhi.GfxSampler nearestSampler;
+
+    /** History bindings as the passes resolved them when the graph was built. */
+    private Map<String, String> historyAtBuild;
 
     /**
      * The render pass a body's pipeline must be compatible with.
@@ -189,11 +272,63 @@ public final class PackGraphBuilder {
         return rp;
     }
 
+    /**
+     * The widened-seam resource this pass reads, or null. The write side is
+     * deliberately absent: a dispatch is not a bake, so the graph has nothing to
+     * record when the producer runs (see the note at the pass body).
+     */
+    private String biomeVolumeReadBy(GraphSpec.PassSpec p) {
+        for (String r : p.reads) {
+            if (isBiomeSeamResource(r)) return r;
+        }
+        return null;
+    }
+
+    /** A resource is a widened seam when the pack declared it at biome-volume size. */
+    private boolean isBiomeSeamResource(String name) {
+        GraphSpec.ResourceSpec r = manifest.graph.findResource(name);
+        return r != null && r.sizeKind == GraphSpec.SizeKind.BIOME_VOLUME;
+    }
+
     /** Maps {@code foo.prev} / {@code foo.cur} onto the history pair's real names. */
+    /**
+     * The same resolution, against a graph handed in at call time.
+     *
+     * <p>Needed because descriptor binding happens while the frame RUNS, when
+     * the builder no longer holds the graph it built: resolving against
+     * {@link #activeGraph} there always answered "no such history" and the bind
+     * failed with `unknown resource 'taa_cur'` on a pack that had just been
+     * compiled successfully. A lookup that depends on build-time state cannot
+     * serve a frame-time caller.
+     */
+    private String resolveHistoryName(String declared, dev.auralite.render.graph.RenderGraph graph) {
+        if (graph == null) return declared;
+        for (dev.auralite.render.graph.GraphHistory h : graph.histories()) {
+            // Both spellings: a pass declaration writes `taa.cur` (the pack
+            // format's dotted form) while a GLSL uniform cannot contain a dot,
+            // so a shader that samples the history writes `taa_cur`. A resolver
+            // that only knew the dotted form answered "no such resource" for a
+            // stage that had compiled and bound fine everywhere else.
+            if (declared.equals(h.logicalName() + ".prev")
+                    || declared.equals(h.logicalName() + "_prev")) return h.previousName();
+            if (declared.equals(h.logicalName() + ".cur")
+                    || declared.equals(h.logicalName() + "_cur")) return h.currentName();
+            if (declared.equals(h.logicalName())) return h.currentName();
+        }
+        return declared;
+    }
+
     private String resolveHistoryName(String declared) {
         for (dev.auralite.render.graph.GraphHistory h : historyList()) {
-            if (declared.equals(h.logicalName() + ".prev")) return h.previousName();
-            if (declared.equals(h.logicalName() + ".cur")) return h.currentName();
+            // Both spellings: a pass declaration writes `taa.cur` (the pack
+            // format's dotted form) while a GLSL uniform cannot contain a dot,
+            // so a shader that samples the history writes `taa_cur`. A resolver
+            // that only knew the dotted form answered "no such resource" for a
+            // stage that had compiled and bound fine everywhere else.
+            if (declared.equals(h.logicalName() + ".prev")
+                    || declared.equals(h.logicalName() + "_prev")) return h.previousName();
+            if (declared.equals(h.logicalName() + ".cur")
+                    || declared.equals(h.logicalName() + "_cur")) return h.currentName();
             if (declared.equals(h.logicalName())) return h.currentName();
         }
         return declared;
@@ -328,13 +463,38 @@ public final class PackGraphBuilder {
 
     // --------------------------------------------------------------- dispatch
     /** Evaluates a dispatch clause such as {@code ceil(width/8),ceil(height/8),1}. */
+    /**
+     * The extent {@code width}/{@code height} in a pass's dispatch expression.
+     * A bake is sized by the image it fills, not by the screen; anything else
+     * leaves it wide enough to dispatch thousands of out-of-range invocations,
+     * which reads as "the volume did not update" rather than as an error.
+     */
+    private int[] dispatchBase(GraphSpec.PassSpec p) {
+        if (!"write".equals(p.dispatchBase) || p.writes.isEmpty()) return null;
+        GraphSpec.ResourceSpec r = manifest.graph.findResource(p.writes.get(0));
+        if (r == null) return null;
+        int[] ext = r.extent(lastWidth, lastHeight, lastShadowSize, lastBiomeCells);
+        return ext;
+    }
+
     public static int[] resolveDispatch(GraphSpec.PassSpec p, ExprEnv env, int width, int height) {
+        return resolveDispatch(p, env, width, height, null);
+    }
+
+    public static int[] resolveDispatch(GraphSpec.PassSpec p, ExprEnv env, int width, int height,
+                                        int[] base) {
         if (p.dispatchX > 0) return new int[] { p.dispatchX, Math.max(1, p.dispatchY), Math.max(1, p.dispatchZ) };
         if (p.dispatchExpr == null || p.dispatchExpr.trim().isEmpty()) {
             return new int[] { 1, 1, 1 };
         }
-        env.bindInt("width", width);
-        env.bindInt("height", height);
+        // width/height/depth are the extents a pass dispatches over. Without a
+        // resource base they are the framebuffer's, which has no depth; with
+        // one they are the target image's, which for a 3D bake is the whole
+        // point -- a dispatch of z = 1 leaves every layer above the first
+        // unwritten, and the frame then samples exactly those layers.
+        env.bindInt("width", base != null ? base[0] : width);
+        env.bindInt("height", base != null ? base[1] : height);
+        env.bindInt("depth", base != null ? base[2] : 1);
         List<String> parts = splitTopLevel(p.dispatchExpr, ',');
         int[] out = new int[] { 1, 1, 1 };
         for (int i = 0; i < Math.min(3, parts.size()); i++) {

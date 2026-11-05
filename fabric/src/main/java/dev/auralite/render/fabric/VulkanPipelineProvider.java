@@ -59,13 +59,13 @@ public final class VulkanPipelineProvider implements PipelineProvider {
                 .named(programName);
         if (p != null && p.stage(GfxStage.VERTEX) != null) {
             GfxShaderModule vs = device.createShaderModule(
-                    compiler.toSpirv(optionDefines(p.stage(GfxStage.VERTEX))));
+                    compiler.toSpirv(pack.withOptionDefines(p.stage(GfxStage.VERTEX))));
             modules.add(vs);
             desc.stage(vs);
         }
         if (p != null && p.stage(GfxStage.FRAGMENT) != null) {
             GfxShaderModule fs = device.createShaderModule(
-                    compiler.toSpirv(optionDefines(p.stage(GfxStage.FRAGMENT))));
+                    compiler.toSpirv(pack.withOptionDefines(p.stage(GfxStage.FRAGMENT))));
             modules.add(fs);
             desc.stage(fs);
         }
@@ -83,7 +83,7 @@ public final class VulkanPipelineProvider implements PipelineProvider {
         PackProgram p = pack.program(programName);
         if (p == null || p.stage(GfxStage.COMPUTE) == null) return null;
         GfxShaderModule cs = device.createShaderModule(
-                compiler.toSpirv(optionDefines(p.stage(GfxStage.COMPUTE))));
+                compiler.toSpirv(pack.withOptionDefines(p.stage(GfxStage.COMPUTE))));
         modules.add(cs);
         GfxPipeline pipe = device.createComputePipeline(GfxDesc.ComputePipeline
                 .of(cs)
@@ -98,22 +98,6 @@ public final class VulkanPipelineProvider implements PipelineProvider {
     public boolean has(String programName) {
         PackProgram p = pack.program(programName);
         return p != null && p.stageCount() > 0;
-    }
-
-    /**
-     * The stage with the pack's active option defines prepended - the option
-     * lane reaching glslangValidator. Same stripping as GlPipelineProvider:
-     * activeDefines() hands out complete "#define NAME value" lines, so the
-     * "#define " prefix comes off before withDefines re-adds it.
-     */
-    private ShaderSource optionDefines(ShaderSource src) {
-        if (src == null || src.kind() != ShaderSource.Kind.GLSL) return src;
-        List<String> bare = new ArrayList<String>();
-        for (String line : pack.activeDefines()) {
-            if (line.startsWith("#define ")) line = line.substring("#define ".length());
-            if (!line.isEmpty()) bare.add(line);
-        }
-        return bare.isEmpty() ? src : src.withDefines(bare);
     }
 
     /** Called on pack reload/resize/debug-view: pipelines and stages die. */

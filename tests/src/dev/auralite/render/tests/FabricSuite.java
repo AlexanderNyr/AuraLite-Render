@@ -69,10 +69,21 @@ public final class FabricSuite {
         try {
             String mj = read(mixinsJson);
             contains(mj, "\"JAVA_21\"", "the mixin compatibility level is java 21");
-            contains(mj, "MinecraftClientMixin", "the frame hook mixin is listed");
+            // The hook moved from the client ticker to the game renderer in the
+            // upstream "Bugfix" commit, and back again later; the contract, not
+            // the class name, is what this gate is about: one mixin, listed, and
+            // it calls the loop. Whichever name the sources currently use, the
+            // listed file must be the one that exists.
+            String mixinName = "MinecraftClientMixin";
             Path mixinSrc = root.resolve(
-                    "src/main/java/dev/auralite/render/fabric/mixin/MinecraftClientMixin.java");
-            check(Files.isRegularFile(mixinSrc), "GameRendererMixin.java exists");
+                    "src/main/java/dev/auralite/render/fabric/mixin/" + mixinName + ".java");
+            if (!Files.isRegularFile(mixinSrc)) {
+                mixinName = "GameRendererMixin";
+                mixinSrc = root.resolve(
+                        "src/main/java/dev/auralite/render/fabric/mixin/" + mixinName + ".java");
+            }
+            contains(mj, mixinName, "the frame hook mixin is listed");
+            check(Files.isRegularFile(mixinSrc), mixinName + ".java exists (" + mixinName + ")");
             contains(read(mixinSrc), "RendererLoop.frame",
                     "the mixin drives the renderer loop");
         } catch (Exception e) {

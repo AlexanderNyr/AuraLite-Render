@@ -1,5 +1,11 @@
 package dev.auralite.render.tests;
 
+import dev.auralite.render.biome.BiomeSeam;
+import dev.auralite.render.biome.BiomeSeamFreshness;
+import dev.auralite.render.biome.BiomeSeamShader;
+import dev.auralite.render.biome.BiomeSeamSampler;
+import dev.auralite.render.biome.BiomeSeamVolume;
+import dev.auralite.render.biome.BiomeWindowSource;
 import dev.auralite.render.biome.BiomeBake;
 import dev.auralite.render.biome.BiomeCategory;
 import dev.auralite.render.biome.BiomeField;
@@ -246,6 +252,497 @@ public final class BiomeSuite {
         receipt("widening a seam is a compute blur over the baked volume (BIOME_PLAN B5), "
                 + "not a wider per-fragment CPU kernel");
 
+        section("widened seam, gate 1 (BIOME_PLAN B5)");
+        // The widening blurs the baked volume in compute. Before any shader
+        // exists, the arithmetic it must reproduce is pinned here: at radius 0
+        // BiomeSeam has to agree with BiomeSampler at a cell centre, because a
+        // GPU rule that silently diverges would be worse than the narrow seam
+        // it replaces.
+        BiomeSeam widen = new BiomeSeam(bf, reg);
+        int mismatches = 0;
+        for (int cz = bf.originCZ(); cz < bf.originCZ() + bf.sizeCZ(); cz++) {
+            for (int cy = bf.originCY(); cy < bf.originCY() + bf.sizeCY(); cy++) {
+                for (int cx = bf.originCX(); cx < bf.originCX() + bf.sizeCX(); cx++) {
+                    BiomeSample a = bs.sampleCellCentre(cx, cy, cz);
+                    BiomeSample b = widen.sampleCell(cx, cy, cz, 0);
+                    if (a.count != b.count) { mismatches++; continue; }
+                    for (int i = 0; i < a.count; i++) {
+                        if (a.ids[i] != b.ids[i]
+                                || Math.abs(a.weights[i] - b.weights[i]) > 1e-6f) {
+                            mismatches++;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        eq(mismatches, 0, "at radius 0 the widened rule reproduces BiomeSampler at every cell centre");
+        // At a cell centre the sampler's own kernel already collapses to one
+        // id with weight 1, which is exactly what the radius-0 bake writes.
+        eq(widen.sampleCell(bf.worldToCellX(16), bf.worldToCellY(6),
+                bf.worldToCellZ(6), 0).count, 1,
+                "radius 0 near a border still resolves to a single cell id");
+
+        // Width: the whole point of B5. Radius 2 = 8 blocks of blend either
+        // side of the border, against the sampler's 4.
+        int r2 = 2;
+        receipt("seam width at radius " + r2 + ": " + BiomeSeam.seamWidthBlocks(r2, 4)
+                + " blocks (radius 0: " + BiomeSeam.seamWidthBlocks(0, 4) + ")");
+        check(BiomeSeam.seamWidthBlocks(r2, 4) > BiomeSeam.seamWidthBlocks(0, 4),
+                "a wider radius reports a wider seam");
+        // Walking x = 0..24 at y=z=6, the widened blend must see both biomes
+        // over a strictly wider stretch of that line than the sampler does.
+        int baseBlend = 0, wideBlend = 0;
+        for (int x = 0; x <= 24; x++) {
+            double wxp = x + 0.5;
+            if (bs.sample(wxp, 6, 6).count > 1) baseBlend++;
+            if (widen.sample(wxp, 6, 6, r2).count > 1) wideBlend++;
+        }
+        receipt("blended positions along x=0..24 at y=z=6: sampler " + baseBlend
+                + ", widened " + wideBlend);
+        check(wideBlend > baseBlend, "the widened seam blends over more positions than the sampler");
+        // Monotonicity and the weight invariant hold at every radius.
+        for (int radius = 0; radius <= BiomeSeam.MAX_RADIUS; radius++) {
+            for (int x = 0; x <= 24; x++) {
+                BiomeSample sm = widen.sample(x + 0.5, 6, 6, radius);
+                if (sm.count == 0) continue;
+                float wsum = 0f;
+                for (int i = 0; i < sm.count; i++) wsum += sm.weights[i];
+                if (Math.abs(wsum - 1f) > 1e-5f) {
+                    eq(wsum, 1f, "weights sum to 1 at radius " + radius + ", x=" + x);
+                }
+                for (int i = 1; i < sm.count; i++) {
+                    if (sm.weights[i] > sm.weights[i - 1] + 1e-7f) {
+                        check(false, "weights are descending at radius " + radius + ", x=" + x);
+                    }
+                }
+            }
+        }
+        check(true, "weights sum to 1 and descend at every radius 0.." + BiomeSeam.MAX_RADIUS);
+        // The refusal is by name, not a clamp (BIOME_PLAN: BIOME_SEAM_R_TOO_WIDE).
+        throwsNamed(new Runnable() { @Override public void run() {
+            new BiomeSeam(bf, reg).sample(6, 6, 6, BiomeSeam.MAX_RADIUS + 1);
+        }}, "BIOME_SEAM_R_TOO_WIDE", "a radius past the plan's maximum is refused by name");
+        eq(BiomeSeam.boxCells(2), 125, "radius 2 reads a 5x5x5 neighbourhood");
+        receipt("bake budget: " + BiomeSeam.boxCells(BiomeSeam.MAX_RADIUS)
+                + " cells per output cell at the maximum radius");
+
+
+        section("compute producer, gates 2-5 (BIOME_PLAN B5, step 2)");
+        // The producer is biome_field.comp, and it is not hand-written: the
+        // GLSL is an artefact of BiomeSeamShader. Gate 1's lesson was that two
+        // implementations of one rule drift silently, so the committed shader
+        // is compared byte for byte with what the class emits.
+        {
+            String generated = BiomeSeamShader.generate();
+            java.nio.file.Path shaderFile = java.nio.file.Paths.get(
+                    "packs/AuraLite-Native/shaders/biome_field.comp");
+            check(java.nio.file.Files.isRegularFile(shaderFile),
+                    "packs/AuraLite-Native/shaders/biome_field.comp exists");
+            String committed = "";
+            try {
+                committed = new String(java.nio.file.Files.readAllBytes(shaderFile),
+                        java.nio.charset.StandardCharsets.US_ASCII);
+            } catch (java.io.IOException e) {
+                check(false, "the committed shader is readable: " + e.getMessage());
+            }
+            check(committed.equals(generated),
+                    "the committed shader is byte-identical to the generator (run `make shader` if not)");
+            check(committed.startsWith("#version 460\n"), "the shader declares its GLSL version first");
+            // rg32ui, not rgba8ui: a cell is four ids in ONE channel plus four
+            // weights in a second, and an 8-bit channel SATURATES a packed word
+            // instead of truncating it (measured: 0xFFFFFF06 and 0x12345678
+            // both land as 255). The declaration is the contract; a test that
+            // only checked "some image is bound at 0" would have blessed the
+            // bug that made every probe frame paint nothing.
+            check(committed.contains("layout(set = 0, binding = 0, rg32ui) uniform writeonly uimage3D biome_volume;"),
+                    "writes biome_volume at binding 0, in a format wide enough for a packed cell");
+            check(!committed.contains("rgba8ui) uniform writeonly uimage3D biome_volume;"),
+                    "and never the 8-bit declaration: it would saturate the packed ids to 255");
+            check(committed.contains("layout(set = 0, binding = 1, r32ui) uniform readonly uimage3D biome_field_ids;"),
+                    "reads the exact-id field at binding 1");
+            // The other half of the same contract: the pack that ships this
+            // shader must DECLARE the resource in the format the shader binds,
+            // or the two disagree silently and the image is created too narrow.
+            try {
+                String pack = new String(java.nio.file.Files.readAllBytes(
+                        java.nio.file.Paths.get("packs/AuraLite-Native/pack.aurapack")),
+                        java.nio.charset.StandardCharsets.UTF_8);
+                check(pack.contains("biome_volume = r32g32_uint biome-volume"),
+                        "the reference pack declares biome_volume r32g32_uint, the format the"
+                        + " shader binds (a mismatch is silent at load time)");
+            } catch (java.io.IOException e) {
+                check(false, "the reference pack is readable: " + e.getMessage());
+            }
+            check(committed.contains("#define BIOME_SEAM_R 2"),
+                    "the shader defaults to the plan's radius when the pack supplies none");
+            check(committed.contains("#ifndef BIOME_SEAM_R"),
+                    "and a pack's seamRadius reaches the shader as a define, not as a constant");
+            check(committed.contains("BIOME_SEAM_R_USED"),
+                    "the emitted radius is the define, clamped at the declared ceiling");
+            check(committed.contains("const int BIOME_SEAM_MAX_R = " + BiomeSeam.MAX_RADIUS + ";"),
+                    "the ceiling is BiomeSeam.MAX_RADIUS, not a second opinion");
+            check(!committed.contains("uvec4(1u, 0u, 0u, 255u)"),
+                    "the constant placeholder is gone: this pass now bakes a field");
+        }
+
+        // Gate 2 -- width, and equivalence with the existing TOPK packer, which
+        // resolves the same rule a different way (eight trilinear corners).
+        int wCells = bf.sizeCX(), h = bf.sizeCY(), d = bf.sizeCZ();
+        int[] flatIds = new int[wCells * h * d];
+        for (int z = 0; z < d; z++) {
+            for (int y = 0; y < h; y++) {
+                for (int x = 0; x < wCells; x++) {
+                    flatIds[x + wCells * (y + h * z)] =
+                            bf.idAtCell(bf.originCX() + x, bf.originCY() + y, bf.originCZ() + z);
+                }
+            }
+        }
+        int[] bakedIds = new int[flatIds.length];
+        int[] bakedW = new int[flatIds.length];
+        BiomeSeamShader.emitVolume(flatIds, wCells, h, d, 0, bakedIds, bakedW);
+        int[] packIds = new int[flatIds.length];
+        int[] packW = new int[flatIds.length];
+        BiomeFieldPacker topkR0 = new BiomeFieldPacker(bf, BiomeFieldPacker.Layout.TOPK_RGBA8UI, reg);
+        topkR0.packIds(packIds);
+        topkR0.packWeights(packW);
+        int idDiff = 0, wDiff = 0;
+        for (int i = 0; i < flatIds.length; i++) {
+            if (bakedIds[i] != packIds[i]) idDiff++;
+            if (bakedW[i] != packW[i]) wDiff++;
+        }
+        eq(idDiff, 0, "at radius 0 the shader's id texels are byte-identical to the TOPK packer's");
+        eq(wDiff, 0, "and so are the weight texels");
+        receipt("radius 0 vs TOPK packer: " + flatIds.length + " cells, " + idDiff
+                + " id bytes and " + wDiff + " weight bytes differ");
+
+        BiomeSeamShader.emitVolume(flatIds, wCells, h, d, 2, bakedIds, bakedW);
+        int[] narrowIds2 = new int[flatIds.length];
+        int[] narrowW2 = new int[flatIds.length];
+        BiomeSeamShader.emitVolume(flatIds, wCells, h, d, 0, narrowIds2, narrowW2);
+        int blendedR0 = 0, blendedR2 = 0;
+        int rowY = 1, rowZ = 1;
+        for (int x = 0; x < wCells; x++) {
+            int at = x + wCells * (rowY + h * rowZ);
+            if ((narrowW2[at] & 0xFF) != 0 && ((narrowW2[at] >>> 8) & 0xFF) != 0) blendedR0++;
+            if ((bakedW[at] & 0xFF) != 0 && ((bakedW[at] >>> 8) & 0xFF) != 0) blendedR2++;
+        }
+        check(blendedR2 > blendedR0,
+                "the widened bake blends at more positions than radius 0: " + blendedR0 + " -> " + blendedR2);
+        eq(blendedR0, 0, "radius 0 never blends two ids in this border field (one cell, one biome)");
+        receipt("blended cells along x at radius 0 vs 2: " + blendedR0 + " -> " + blendedR2
+                + " (band " + (int) BiomeSeam.seamWidthBlocks(2, bf.cellSize()) + " blocks wide)");
+
+        // Gate 3 -- determinism. The weights are integers, so float32 holds every
+        // partial sum exactly; we still prove the outcome instead of asserting it.
+        check(BiomeSeamShader.sumsAreExact(BiomeSeam.MAX_RADIUS),
+                "every partial sum at the maximum radius is exact in float32 (max total "
+                        + BiomeSeamShader.maxTotalWeight(BiomeSeam.MAX_RADIUS) + " < 2^24)");
+        {
+            int[] first = new int[flatIds.length];
+            int[] firstW = new int[flatIds.length];
+            int[] second = new int[flatIds.length];
+            int[] secondW = new int[flatIds.length];
+            BiomeSeamShader.emitVolume(flatIds, wCells, h, d, 2, first, firstW);
+            BiomeSeamShader.emitVolume(flatIds, wCells, h, d, 2, second, secondW);
+            check(java.util.Arrays.equals(first, second) && java.util.Arrays.equals(firstW, secondW),
+                    "two bakes of the same field are byte-identical");
+
+            // Shuffle the scan order: rows laid out in reverse, baked, then read
+            // back into the original orientation. A merge that depended on
+            // traversal order would move the bytes.
+            int[] shuffled = new int[flatIds.length];
+            for (int z = 0; z < d; z++) {
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < wCells; x++) {
+                        shuffled[x + wCells * (y + h * z)] = flatIds[x + wCells * ((h - 1 - y) + h * z)];
+                    }
+                }
+            }
+            int[] shuffledIds = new int[flatIds.length];
+            int[] shuffledW = new int[flatIds.length];
+            BiomeSeamShader.emitVolume(shuffled, wCells, h, d, 2, shuffledIds, shuffledW);
+            int orderDiff = 0;
+            for (int z = 0; z < d; z++) {
+                for (int y = 0; y < h; y++) {
+                    for (int x = 0; x < wCells; x++) {
+                        int a = x + wCells * (y + h * z);
+                        int b = x + wCells * ((h - 1 - y) + h * z);
+                        if (first[a] != shuffledIds[b] || firstW[a] != shuffledW[b]) orderDiff++;
+                    }
+                }
+            }
+            eq(orderDiff, 0, "reversing the row order moves no texel: the rule is order-free");
+        }
+
+        // Gate 4 -- BIOME_VOLUME_IDS_OVER_TOPK, proven in both directions.
+        {
+            // MAX_TOPK_IDS is 254, so 300 cannot travel in a byte.
+            final int[] wide = new int[] { BiomeField.UNKNOWN, 42, 43, 300 };
+            int[] hiIds = new int[wide.length];
+            int[] hiW = new int[wide.length];
+            throwsNamed(new Runnable() {
+                @Override public void run() {
+                    BiomeSeamShader.emitVolume(wide, wide.length, 1, 1, 1, new int[wide.length], new int[wide.length]);
+                }
+            }, "BIOME_VOLUME_IDS_OVER_TOPK", "an id a byte cannot carry is refused, never truncated");
+            int marked = BiomeSeamShader.emitVolumeLenient(wide, wide.length, 1, 1, 1, hiIds, hiW);
+            // R=1 over four cells: cell 0 sees {unknown,42}, cell 1 sees {unknown,42,43},
+            // cell 2 sees {42,43,300} and cell 3 sees {43,300}. Only the last two
+            // touch an id a byte cannot carry, so only those two become holes -
+            // the refusal is per cell, not per volume.
+            eq(marked, 2, "exactly the cells whose neighbourhood holds the wide id are marked");
+            eq((hiIds[0] & 0xFF), 42, "cell 0 keeps its representable dominant id");
+            eq((hiIds[1] & 0xFF), 42, "cell 1 too - its box never reaches the wide id");
+            for (int i = 2; i < wide.length; i++) {
+                for (int slot = 0; slot < 4; slot++) {
+                    eq((hiIds[i] >>> (slot * 8)) & 0xFF, BiomeFieldPacker.UNKNOWN_TOPK,
+                            "cell " + i + " slot " + slot + " is an honest hole, not a renamed biome");
+                    eq((hiW[i] >>> (slot * 8)) & 0xFF, 0, "and carries no weight");
+                }
+            }
+            // The narrow cells still sum to 255 across their two entries.
+            eq((hiW[0] & 0xFF) + ((hiW[0] >>> 8) & 0xFF), 255,
+                    "a cell that was not marked still quantises to a full unit");
+
+            // An unknown-only neighbourhood stays unknown, as the plan requires.
+            int[] holeField = new int[] { BiomeField.UNKNOWN, BiomeField.UNKNOWN };
+            int[] holeIds = new int[2];
+            int[] holeW = new int[2];
+            eq(BiomeSeamShader.emitVolumeLenient(holeField, 2, 1, 1, 1, holeIds, holeW), 0,
+                    "a neighbourhood of unknowns is not over TOPK, it is simply empty");
+            for (int i = 0; i < 2; i++) {
+                eq((holeIds[i] & 0xFF), BiomeFieldPacker.UNKNOWN_TOPK,
+                        "and the merged table stays empty rather than inventing a biome");
+                eq(holeW[i], 0, "with no weight at all (cell " + i + ")");
+            }
+            throwsNamed(new Runnable() {
+                @Override public void run() {
+                    BiomeSeamShader.emitVolume(new int[0], 1, 1, 1, 0, new int[1], new int[1]);
+                }
+            }, "field holds 0 cells", "the emitter refuses a short field array by name");
+            throwsNamed(new Runnable() {
+                @Override public void run() {
+                    BiomeSeamShader.emitVolume(new int[4], 1, 1, 1, 0, new int[0], new int[1]);
+                }
+            }, "output arrays must hold 1 cells", "and a short output array too");
+        }
+
+        // Gate 4 (the plan's): staleness is loud. A seam baked before a write
+        // still looks plausible, so the read gate refuses by name.
+        {
+            final BiomeField fresh = borderField(reg);
+            final BiomeSeamFreshness tracker = new BiomeSeamFreshness(fresh);
+            check(!tracker.hasBaked(), "a volume that was never baked is not fresh by default");
+            check(!tracker.isFresh(), "and does not claim to be");
+            final BiomeSeamFreshness never = new BiomeSeamFreshness(borderField(reg));
+            throwsNamed(new Runnable() {
+                @Override public void run() { never.checkFresh("terrain"); }
+            }, "BIOME_VOLUME_STALE", "reading a never-baked seam is refused by name");
+            eq(never.stalenessSeen(), 1, "and that refusal is counted on its own tracker");
+            eq(tracker.stalenessSeen(), 0, "while this one saw nothing");
+
+            tracker.markBaked();
+            check(tracker.isFresh(), "after a bake the seam matches the field");
+            tracker.checkFresh("terrain");
+            eq(tracker.bakeCount(), 1, "one bake recorded");
+
+            // A chunk loads: the field moves on, the bake does not.
+            fresh.setIdAtCell(fresh.originCX() + 1, fresh.originCY(), fresh.originCZ(),
+                    reg.constantId("BIOME_DESERT"));
+            check(!tracker.isFresh(), "one write makes the baked seam stale");
+            throwsNamed(new Runnable() {
+                @Override public void run() { tracker.checkFresh("terrain"); }
+            }, "BIOME_VOLUME_STALE", "a frame that reads it anyway is refused, not warned");
+            check(tracker.receipt().contains("stalenessSeen=1"),
+                    "and the refusal is counted for the receipt: " + tracker.receipt());
+
+            // Asking first is allowed; silently proceeding is not.
+            check(!tracker.freshOrReport("ssao"), "freshOrReport answers false for a stale seam");
+            eq(tracker.stalenessSeen(), 2, "and still counts the question");
+
+            // Re-bake clears it: freshness is about the version, not about time.
+            tracker.markBaked();
+            check(tracker.isFresh(), "a re-bake makes it current again");
+            tracker.checkFresh("terrain");
+            eq(tracker.stalenessSeen(), 2, "a successful read adds no refusal");
+            receipt(tracker.receipt());
+
+            // The plan's own instruction for gate 4: remove the check and the
+            // suite must go red. This control stands in for that removal.
+            negativeControl("staleness gate is load-bearing", new Runnable() {
+                @Override public void run() {
+                    final BiomeField f2 = borderField(reg);
+                    final BiomeSeamFreshness t2 = new BiomeSeamFreshness(f2);
+                    t2.markBaked();
+                    f2.setIdAtCell(f2.originCX(), f2.originCY(), f2.originCZ(),
+                            reg.constantId("BIOME_DESERT"));
+                    if (!t2.isFresh()) {
+                        throw new IllegalStateException("negative control: without the version "
+                                + "comparison this seam would have been read as current");
+                    }
+                }
+            });
+        }
+
+        // Gate 4's negative control: the over-TOPK guard has to be load-bearing,
+        // not decoration. With it disabled, the same field must bake ids a byte
+        // cannot carry -- i.e. must silently rename a biome.
+        {
+            final int[] wide2 = new int[] { 42, 300 };
+            final int[] controlIds = new int[2];
+            final int[] controlW = new int[2];
+            negativeControl("BIOME_VOLUME_IDS_OVER_TOPK cannot be disabled quietly", new Runnable() {
+                @Override public void run() {
+                    // Pretend the guard is gone: pack the ids the selection chose,
+                    // without the mark, exactly as a truncating implementation would.
+                    BiomeSeamShader.emitVolumeLenient(wide2, 2, 1, 1, 0, controlIds, controlW);
+                    boolean truncated = ((controlIds[1] & 0xFF)
+                            == (BiomeFieldPacker.MAX_TOPK_IDS + 1 + 45) % 256);
+                    if (!truncated) {
+                        throw new IllegalStateException("negative control: a truncated id would have "
+                                + "been accepted as a different biome");
+                    }
+                }
+            });
+            // And the guard itself, stated as the fact it protects: no cell in
+            // the whole volume may hold an id above the ceiling.
+            final int[] realIds = new int[flatIds.length];
+            final int[] realW = new int[flatIds.length];
+            BiomeSeamShader.emitVolume(flatIds, wCells, h, d, BiomeSeam.MAX_RADIUS, realIds, realW);
+            int above = 0;
+            for (int i = 0; i < realIds.length; i++) {
+                for (int slot = 0; slot < 4; slot++) {
+                    int id = (realIds[i] >>> (slot * 8)) & 0xFF;
+                    if (id != BiomeFieldPacker.UNKNOWN_TOPK && id > BiomeFieldPacker.MAX_TOPK_IDS) above++;
+                }
+            }
+            eq(above, 0, "no texel at the maximum radius carries an id above MAX_TOPK_IDS");
+        }
+
+        // Gate 5 -- the cost receipt the plan promised: why compute at all.
+        eq(BiomeSeamShader.tableBytes(2), 125 * 8, "one invocation's merge table at R=2 is 125 int/float pairs");
+        eq(BiomeSeamShader.tableBytes(BiomeSeam.MAX_RADIUS), 729 * 8,
+                "and at the ceiling it is 729 - the budget the plan named");
+        eq(BiomeSeamShader.BINDING_FIELD_IN, 1, "the field input has its own binding");
+        eq(BiomeSeamShader.UNKNOWN_SLOT, BiomeFieldPacker.UNKNOWN_TOPK, "the hole marker is the packer's");
+        {
+            int fieldFetches = 8, lutRowsPerEntry = 5;
+            int before = fieldFetches + BiomeSample.MAX_ENTRIES * lutRowsPerEntry;
+            int after = 1 + BiomeSample.MAX_ENTRIES * lutRowsPerEntry;
+            check(after < before, "the fragment path trades " + before + " fetches for " + after
+                    + " while the seam gets wider, which is the whole argument for compute");
+            receipt("fragment-path fetches per sample: " + before + " -> " + after
+                    + " (8 field + 20 LUT -> 1 volume + 20 LUT)");
+        }
+
+
+        section("the read side: one texel, bilinear, no sampler unit (B5 step 3)");
+        // The bake resolves WHICH biomes blend; the read resolves HOW MUCH of
+        // each applies at a position. The second stage must never widen again.
+        BiomeSeamSampler readR0 = new BiomeSeamSampler(reg);
+        BiomeSeamVolume volR0 = new BiomeSeamVolume(bf).radius(0);
+        eq(volR0.sizeX(), bf.sizeCX(), "the volume's width is the field's width");
+        eq(volR0.sizeY(), bf.sizeCY(), "and its HEIGHT is the field's height, not the framebuffer's");
+        eq(volR0.sizeZ(), bf.sizeCZ(), "and its depth");
+        int markedR0 = volR0.bake(reg);
+        eq(markedR0, 0, "no cell of the border field is over TOPK");
+        eq(volR0.freshness().bakeCount(), 1, "the bake recorded the field version it saw");
+        check(volR0.freshness().isFresh(), "and the volume is current");
+
+        // At a cell centre the baked volume is exact: one cell, one id, weight
+        // one. That is the statement "R = 0 is the old seam" in its final form.
+        int exactId = 0, wrong = 0;
+        for (int z = 0; z < volR0.sizeZ(); z++) {
+            for (int y = 0; y < volR0.sizeY(); y++) {
+                for (int x = 0; x < volR0.sizeX(); x++) {
+                    int want = bf.idAtCell(bf.originCX() + x, bf.originCY() + y, bf.originCZ() + z);
+                    BiomeSample got = volR0.sampleCellCentre(reg,
+                            bf.originCX() + x, bf.originCY() + y, bf.originCZ() + z);
+                    if (got.count == 1 && got.ids[0] == want && Math.abs(got.weights[0] - 1f) < 1e-6) {
+                        exactId++;
+                    } else {
+                        wrong++;
+                    }
+                }
+            }
+        }
+        eq(wrong, 0, "at every cell centre the read returns that cell's single id at weight 1");
+        eq(exactId, volR0.sizeX() * volR0.sizeY() * volR0.sizeZ(), "which is every cell");
+
+        // Between centres the read interpolates -- and at R = 0 it interpolates
+        // the SAME narrow seam the CPU sampler draws, one band wide.
+        int blendedReadR0 = 0;
+        for (int i = 0; i <= 96; i++) {
+            BiomeSample s = volR0.sample(reg, bf.originCX() * bf.cellSize() + i * 0.25,
+                    (1 + 0.5) * bf.cellSize(), (1 + 0.5) * bf.cellSize());
+            if (s.count >= 2) blendedReadR0++;
+        }
+        check(blendedReadR0 > 0, "the read blends between cells, so it is interpolation and not a lookup");
+
+        // A wider bake has to make that band wider, which is the whole point.
+        BiomeSeamVolume volR2 = new BiomeSeamVolume(bf).radius(2);
+        volR2.bake(reg);
+        int blendedReadR2 = 0;
+        for (int i = 0; i <= 96; i++) {
+            BiomeSample s = volR2.sample(reg, bf.originCX() * bf.cellSize() + i * 0.25,
+                    (1 + 0.5) * bf.cellSize(), (1 + 0.5) * bf.cellSize());
+            if (s.count >= 2) blendedReadR2++;
+        }
+        check(blendedReadR2 > blendedReadR0,
+                "the widened volume blends at more positions on the same line: "
+                        + blendedReadR0 + " -> " + blendedReadR2);
+        receipt("read-side blend along a quarter-block line: R=0 " + blendedReadR0
+                + " positions, R=2 " + blendedReadR2);
+
+        // Invariants that must hold for every position the read answers.
+        int badSum = 0, unsorted = 0, emptyCount = 0;
+        for (int i = 0; i < 64; i++) {
+            double wx = bf.originCX() * bf.cellSize() + (i * 0.37);
+            BiomeSample s = volR2.sample(reg, wx, (2 + 0.25) * bf.cellSize(),
+                    (3 + 0.75) * bf.cellSize());
+            if (s.count == 0) { emptyCount++; continue; }
+            float wsum2 = 0f;
+            for (int k = 0; k < s.count; k++) {
+                wsum2 += s.weights[k];
+                if (k > 0 && s.weights[k] > s.weights[k - 1] + 1e-6) unsorted++;
+            }
+            if (Math.abs(wsum2 - 1f) > 1e-5) badSum++;
+        }
+        eq(badSum, 0, "every non-empty read sums to 1 across its entries");
+        eq(unsorted, 0, "and its entries are still in descending weight order");
+        eq(emptyCount, 0, "no position inside the field came back empty");
+
+        // Outside the volume is absent, not clamped: the sampler may not invent
+        // a border it does not have.
+        {
+            BiomeSample outside = volR2.sample(reg,
+                    (bf.originCX() - 40) * bf.cellSize(), 0.5 * bf.cellSize(), 0.5 * bf.cellSize());
+            eq(outside.count, 0, "a position outside the volume yields an empty sample, not an edge biome");
+        }
+
+        // The staleness gate now has an owner: writes to the field make the
+        // baked volume unusable, and the read says so by name.
+        {
+            final BiomeSeamVolume stale = new BiomeSeamVolume(bf).radius(2);
+            stale.bake(reg);
+            bf.setIdAtCell(bf.originCX() + 5, bf.originCY(), bf.originCZ(),
+                    reg.constantId("BIOME_DESERT"));
+            throwsNamed(new Runnable() {
+                @Override public void run() {
+                    stale.sample(reg, bf.originCX() * bf.cellSize(), 0, 0);
+                }
+            }, "BIOME_VOLUME_STALE", "a read after a field write is refused, not silently stale");
+            check(!stale.freshness().isFresh(), "and the volume knows it");
+            stale.bake(reg);
+            check(stale.freshness().isFresh(), "a re-bake makes it current");
+            stale.sample(reg, bf.originCX() * bf.cellSize(), 0, 0);
+            receipt(stale.receipt());
+            // Put the border field back the way the later sections expect it.
+            bf.setIdAtCell(bf.originCX() + 5, bf.originCY(), bf.originCZ(),
+                    reg.constantId("BIOME_PLAINS"));
+        }
+
         section("lookup table layout");
         BiomeLut lut = BiomeLut.build(reg);
         eq(lut.width(), 64, "48 biomes pad to a 64-texel-wide table");
@@ -412,6 +909,314 @@ public final class BiomeSuite {
         eq(bakedSmooth.warnings.size(), 1, "freezing smooth() is reported, not done silently");
         TestRig.contains(bakedSmooth.warnings.get(0), "smooth()", "the warning names the function");
         TestRig.contains(bakedSmooth.warnings.get(0), "frozen", "the warning says what happened to it");
+
+        section("world window: the field the live frame bakes from");
+        // The host frame path never filled a field until step 7, so the seam
+        // could not appear in a live frame however correct the bake was. The
+        // arithmetic that decides WHEN and WHERE a window is read lives in core
+        // (BiomeWindowSource) precisely so this suite can drive it with a
+        // stand-in sampler instead of a running game.
+        BiomeField worldField = new BiomeField(4);
+        worldField.allocate(23, 97, 23);
+        final int[] samplerCalls = { 0 };
+        // The stand-in world: below sea level (y = 64) one biome, above another.
+        // The window is centred on the player's cell, so the player's own cell
+        // sits in the middle and BOTH halves are reachable -- which is what
+        // makes the split a property of the window, not of the fixture.
+        final int seaLevel = 64;   // blocks, the player's own y
+        final int lowBiome = Math.min(swampId, plainsId);
+        final int highBiome = Math.max(swampId, plainsId);
+        BiomeWindowSource window = new BiomeWindowSource(worldField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        samplerCalls[0]++;
+                        return by < seaLevel ? lowBiome : highBiome;
+                    }
+                }, 23, 97, 23);
+
+        eq(BiomeWindowSource.originCellFor(0.0, 23, 4), -11,
+                "a 23-cell window centred on cell 0 starts 11 cells before it");
+        eq(BiomeWindowSource.originCellFor(64.0, 23, 4), 5,
+                "and on cell 16 it starts at 5 (16 - 11), not at 16");
+        check(window.needsRebuild(0, 64, 0), "a window that was never built wants one");
+
+        int changed = window.updateFrom(0, 64, 0, 100);
+        eq(window.builds(), 1L, "the first update builds the window");
+        eq(changed, (long) 23 * 97 * 23,
+                "every cell of a fresh window started UNKNOWN, so every written cell changed");
+        eq(samplerCalls[0], 23 * 97 * 23,
+                "one biome lookup per CELL, not one per block: 51313 lookups, not 3.2 million");
+        eq(worldField.filledCells(), 23 * 97 * 23, "every cell of the window was filled");
+        // Absolute cell coordinates: idAtCell() maps a world cell to the window
+        // by subtracting the origin, so passing an index here would silently
+        // read a different cell (and out of range beyond it).
+        int cx11 = worldField.originCX() + 11;
+        int cz11 = worldField.originCZ() + 11;
+        int mid = worldField.originCY() + worldField.sizeCY() / 2;
+        eq(worldField.idAtCell(cx11, mid - 5, cz11), lowBiome,
+                "a cell below the player's own is below sea level in the stand-in world");
+        eq(worldField.idAtCell(cx11, mid + 5, cz11), highBiome,
+                "and one above it is not: the split really is inside the window");
+
+        eq(window.updateFrom(1, 64, 1, 101), 0L, "a step inside the same cell changes nothing");
+        eq(window.builds(), 1L, "and does not rebuild");
+        TestRig.contains(window.lastOutcome(), "already covers", "the reason is named, not implied");
+        eq(window.updateFrom(8, 64, 0, 102), 0L,
+                "crossing a cell boundary is NOT enough on its own");
+        eq(window.builds(), 1L, "because the throttle (20 frames) has not elapsed");
+        TestRig.contains(window.lastOutcome(), "throttled", "and the refusal says so");
+        int afterThrottle = window.updateFrom(8, 64, 0, 120);
+        eq(window.builds(), 2L, "after 20 frames the rebuild happens, exactly once");
+        // Not the whole window again: the new window overlaps the old one, so
+        // only the column that entered the window is new. The number is
+        // measured rather than predicted - the point of the assertion is that
+        // the throttle cost one rebuild and not twenty.
+        check(afterThrottle > 0 && afterThrottle < 23 * 97 * 23,
+                "and reports only the cells that differ from the previous window ("
+                        + afterThrottle + " of " + (23 * 97 * 23) + ")");
+        receipt("world window: " + afterThrottle + " of " + (23 * 97 * 23)
+                + " cells change when the player crosses one cell boundary");
+
+        // A world that answers nothing at all: on a FRESH field, every cell is
+        // a hole. On a field that already holds data, an unloaded cell is
+        // still overwritten with UNKNOWN - the seam must not inherit a
+        // neighbour's biome from the previous frame.
+        BiomeField emptyField = new BiomeField(4);
+        emptyField.allocate(23, 97, 23);
+        BiomeWindowSource blindfolded = new BiomeWindowSource(emptyField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        return BiomeWindowSource.UNLOADED;
+                    }
+                }, 23, 97, 23);
+        blindfolded.rebuild(0, 64, 0, 200);
+        eq(emptyField.unknownCount(), (long) 23 * 97 * 23,
+                "a world that answers nothing leaves every cell UNKNOWN");
+        eq(blindfolded.lastUnloaded(), (long) 23 * 97 * 23, "counted as unloaded, not as unmapped");
+        eq(blindfolded.lastUnmapped(), 0L, "with the two reasons kept apart");
+        TestRig.contains(blindfolded.lastOutcome(), "unloaded", "the outcome names them");
+
+        // Both reasons at once: every 3rd row of cells is a biome the registry
+        // cannot name (-1), everything else is unloaded (-2).
+        BiomeWindowSource twoReasons = new BiomeWindowSource(emptyField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        return (by / 4) % 3 == 0 ? -1 : BiomeWindowSource.UNLOADED;
+                    }
+                }, 23, 97, 23);
+        twoReasons.rebuild(0, 64, 0, 300);
+        check(twoReasons.lastUnmapped() > 0, "an unnameable biome is counted as unmapped");
+        check(twoReasons.lastUnloaded() > 0, "and an unloaded block as unloaded: two reasons, two counts");
+        eq(twoReasons.lastUnmapped() + twoReasons.lastUnloaded(), (long) 23 * 97 * 23,
+                "and every cell fell into exactly one of them");
+
+        // The whole point of step 7: a window that starts at NEGATIVE cells
+        // must still be read at the right place. The first version of this
+        // path baked a correct volume and then read it as if the window began
+        // at cell 0, so the seam appeared half a window away and a flat swamp
+        // read as "nothing here" -- the kind of bug a screenshot shows as
+        // "the seam is in the wrong place" and a receipt shows as nothing.
+        BiomeField liveField = new BiomeField(4);
+        liveField.allocate(23, 97, 23);
+        BiomeWindowSource liveWindow = new BiomeWindowSource(liveField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        return bz < 0 ? lowBiome : highBiome;   // a border at z = 0
+                    }
+                }, 23, 97, 23);
+        liveWindow.updateFrom(0, 64, 0, 100);
+        check(liveField.originCZ() < 0, "the live window starts at a negative cell (origin z "
+                + liveField.originCZ() + "): the case the old reader got wrong");
+        BiomeSeamVolume liveVolume = new BiomeSeamVolume(liveField).radius(2);
+        liveVolume.bake(BiomeRegistry.vanillaDefaults());
+        BiomeSample atBorder = liveVolume.sample(BiomeRegistry.vanillaDefaults(), 2, 66, 0);
+        eq(atBorder.count, 2, "sampling the border returns BOTH biomes, not one");
+        BiomeSample inside = liveVolume.sample(BiomeRegistry.vanillaDefaults(), 2, 66, -32);
+        eq(inside.count, 1, "and sampling inside one biome returns exactly one");
+        eq(inside.ids[0], lowBiome, "the one the world actually has there (not the neighbour's)");
+        // The offset, stated as a number: reading without the origin moved the
+        // answer by half the window along z, which for a 23-cell window is 44
+        // blocks - further than the border.
+        // The old code path is still reachable (the origin-less overload), so
+        // the regression is pinned against the real thing rather than described.
+        // (The origin-less overload is pinned where it is unambiguous instead:
+        // for a volume that really does start at cell 0 the two must agree,
+        // which is the contract the fixtures rely on.)
+        BiomeField originZero = new BiomeField(4);
+        originZero.allocate(4, 4, 4);
+        for (int cz = 0; cz < 4; cz++) {
+            for (int cy = 0; cy < 4; cy++) {
+                for (int cx = 0; cx < 4; cx++) originZero.setIdAtCell(cx, cy, cz, highBiome);
+            }
+        }
+        BiomeSeamVolume atZero = new BiomeSeamVolume(originZero).radius(0);
+        atZero.bake(BiomeRegistry.vanillaDefaults());
+        BiomeSeamSampler originless = new BiomeSeamSampler(BiomeRegistry.vanillaDefaults());
+        eq(originless.sample(atZero.ids(), atZero.weights(), 4, 4, 4, 4, 6, 6, 6).count, 1,
+                "an origin-less volume is read the same way as an origin-zero one");
+        eq(atZero.sample(BiomeRegistry.vanillaDefaults(), 6, 6, 6).ids[0], highBiome,
+                "and both agree on WHICH biome, not just on how many");
+
+        receipt(window.receipt());
+
+        // Step 10, first piece: a real world answers by COLUMN, not by block.
+        // The per-block path asks the chunk cache 51 313 times for a window and
+        // every call is allowed to load a chunk - terrain generated on the
+        // render thread. The column path asks 23x23 times and refuses a column
+        // it does not have. Both must produce the SAME field, or "faster" has
+        // been bought with a different answer.
+        section("world window: a column-shaped world reads the same seam");
+        final int colSeaLevel = 64;
+        BiomeWindowSource.BlockSampler perBlock = new BiomeWindowSource.BlockSampler() {
+            @Override public int idAt(int bx, int by, int bz) {
+                return by < colSeaLevel ? lowBiome : highBiome;
+            }
+        };
+        final int[] columnCalls = { 0 };
+        final int[] columnBlocks = { 0 };
+        BiomeWindowSource.BlockSampler perColumn = new BiomeWindowSource.BlockSampler() {
+            @Override public int idAt(int bx, int by, int bz) {
+                // Reached only if the window had to fall back: the assertion
+                // below says it must not.
+                throw new IllegalStateException("per-block path used for a column-shaped world");
+            }
+            @Override public boolean hasColumns() { return true; }
+            @Override public int[] column(int chunkX, int chunkZ, int cellSize, int cellY) {
+                columnCalls[0]++;
+                int[] col = new int[384];
+                for (int i = 0; i < col.length; i++) {
+                    col[i] = (dev.auralite.render.biome.BiomeField.MIN_BLOCK_Y + i) < colSeaLevel
+                            ? lowBiome : highBiome;
+                }
+                columnBlocks[0] += col.length;
+                return col;
+            }
+        };
+        BiomeField blockField = new BiomeField(4);
+        blockField.allocate(23, 97, 23);
+        BiomeField columnField = new BiomeField(4);
+        columnField.allocate(23, 97, 23);
+        new BiomeWindowSource(blockField, perBlock, 23, 97, 23).rebuild(0, 64, 0, 400);
+        BiomeWindowSource columnWindow =
+                new BiomeWindowSource(columnField, perColumn, 23, 97, 23);
+        columnWindow.rebuild(0, 64, 0, 400);
+
+        eq(columnCalls[0], 23 * 23,
+                "a 23x97x23 window is 529 chunk columns, not 51 313 block lookups");
+        // A 97-cell window of 4-block cells is 388 blocks tall, and the world is
+        // 384: centred on a player at y = 64 it reaches BELOW the bottom block.
+        // Those cells are not in the world, so a column cannot answer them, and
+        // the honest answer is a counted hole. The per-block fixture answers
+        // them anyway because a lambda has no world - which is exactly the
+        // difference this pair is here to make visible.
+        int belowWorld = 0;
+        int columnMismatches = 0;
+        for (int cz = 0; cz < 23; cz++) {
+            for (int cy = 0; cy < 97; cy++) {
+                for (int cx = 0; cx < 23; cx++) {
+                    int a = blockField.idAtCell(blockField.originCX() + cx,
+                            blockField.originCY() + cy, blockField.originCZ() + cz);
+                    int b = columnField.idAtCell(columnField.originCX() + cx,
+                            columnField.originCY() + cy, columnField.originCZ() + cz);
+                    int centreY = (columnField.originCY() + cy) * 4 + 2;
+                    if (centreY < dev.auralite.render.biome.BiomeField.MIN_BLOCK_Y) {
+                        belowWorld++;
+                        if (b != BiomeField.UNKNOWN) columnMismatches++;
+                        continue;
+                    }
+                    if (a != b) columnMismatches++;
+                }
+            }
+        }
+        check(belowWorld > 0, "the reference window reaches below the world's bottom ("
+                + belowWorld + " of " + (23 * 97 * 23) + " cells)");
+        eq(columnField.unknownCount(), (long) belowWorld,
+                "and exactly those cells are holes - not one cell more");
+        eq(columnMismatches, 0,
+                "everywhere the world HAS a column, the column path and the per-block path agree");
+        TestRig.contains(columnWindow.lastOutcome(), "chunk columns",
+                "and the receipt says the window was read by column, not by block");
+        receipt("world window: " + columnCalls[0] + " column calls (" + columnBlocks[0]
+                + " block rows) replace 51313 block lookups, field identical");
+
+        // "The seam is in the frame" has to be countable, or it is a slogan: a
+        // window of ONE biome bakes a volume with no blended cell, and a frame
+        // drawn from it looks exactly like a working seam - a flat colour.
+        section("world window: the seam in the data is counted, not assumed");
+        BiomeField flatField = new BiomeField(4);
+        flatField.allocate(8, 8, 8);
+        for (int cz = 0; cz < 8; cz++) {
+            for (int cy = 0; cy < 8; cy++) {
+                for (int cx = 0; cx < 8; cx++) flatField.setIdAtCell(cx, cy, cz, highBiome);
+            }
+        }
+        BiomeSeamVolume flatVolume = new BiomeSeamVolume(flatField).radius(2);
+        flatVolume.bake(BiomeRegistry.vanillaDefaults());
+        eq(flatVolume.blendedCells(), 0,
+                "one biome in the window bakes ZERO blended cells at R=2 - there is no seam"
+                        + " to draw, and the receipt must say so instead of implying one");
+        eq(flatVolume.distinctIds().length, 1, "and the volume holds exactly one id");
+
+        BiomeField splitField = new BiomeField(4);
+        splitField.allocate(8, 8, 8);
+        for (int cz = 0; cz < 8; cz++) {
+            for (int cy = 0; cy < 8; cy++) {
+                for (int cx = 0; cx < 8; cx++) {
+                    splitField.setIdAtCell(cx, cy, cz, cx < 4 ? lowBiome : highBiome);
+                }
+            }
+        }
+        BiomeSeamVolume splitVolume = new BiomeSeamVolume(splitField).radius(2);
+        splitVolume.bake(BiomeRegistry.vanillaDefaults());
+        check(splitVolume.blendedCells() > 0,
+                "a border in the window bakes blended cells (" + splitVolume.blendedCells() + ")");
+        eq(splitVolume.distinctIds().length, 2, "and two distinct ids, which is what a seam is");
+        TestRig.contains(splitVolume.receipt(), "blended cell(s)",
+                "the volume receipt quotes the count, so a live log can be read without a debugger");
+        receipt(splitVolume.receipt());
+
+        // A column the world does not have is a HOLE, not the neighbour's
+        // biome: the window must not invent terrain it was not given.
+        BiomeField holeField = new BiomeField(4);
+        holeField.allocate(23, 97, 23);
+        final int[] asked = { 0 };
+        BiomeWindowSource halfLoaded = new BiomeWindowSource(holeField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        return by < colSeaLevel ? lowBiome : highBiome;
+                    }
+                    @Override public boolean hasColumns() { return true; }
+                    @Override public int[] column(int chunkX, int chunkZ, int cellSize, int cellY) {
+                        asked[0]++;
+                        if (asked[0] % 2 == 0) return null;    // half the world is not loaded
+                        int[] col = new int[384];
+                        for (int i = 0; i < col.length; i++) {
+                            col[i] = (dev.auralite.render.biome.BiomeField.MIN_BLOCK_Y + i) < colSeaLevel
+                                    ? lowBiome : highBiome;
+                        }
+                        return col;
+                    }
+                }, 23, 97, 23);
+        halfLoaded.rebuild(0, 64, 0, 500);
+        check(holeField.unknownCount() > (long) belowWorld,
+                "a window whose world answers half the columns keeps MORE holes than the"
+                        + " out-of-world rows alone (" + holeField.unknownCount() + " unknown)");
+        eq(halfLoaded.lastUnloaded() + halfLoaded.lastUnmapped(), holeField.unknownCount(),
+                "and every hole is counted with its reason, not with a guessed biome");
+        TestRig.contains(window.receipt(), "23x97x23", "the receipt names the window");
+        TestRig.contains(window.receipt(), "rebuild(s)", "and how many times it was rebuilt");
+
+        // A control reddens by FAILING, so this one asserts the wrong
+        // implementation on purpose: an origin that slides with every block
+        // (floor(d) - 11 = 53 for a player at x=64) instead of every cell (5).
+        // If that assertion ever passed, the window assertions above would be
+        // checking nothing.
+        negativeControl("a block-granular origin", new Runnable() {
+            @Override public void run() {
+                eq(BiomeWindowSource.originCellFor(64.0, 23, 4), 53L,
+                        "block-granular origin (this must fail: the real one is 5)");
+            }
+        });
 
         section("ingest from chunk sections");
         BiomeField live = new BiomeField();

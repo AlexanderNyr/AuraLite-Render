@@ -2,6 +2,8 @@ package dev.auralite.render.fabric;
 
 import dev.auralite.render.backend.gl.GlDevice;
 import dev.auralite.render.backend.vk.VkDevice;
+import dev.auralite.render.biome.BiomeRegistry;
+import dev.auralite.render.biome.BiomeSeamVolume;
 import dev.auralite.render.graph.CompiledGraph;
 import dev.auralite.render.graph.GraphContext;
 import dev.auralite.render.graph.RenderGraph;
@@ -51,6 +53,11 @@ public final class RendererLoop {
     private static PackWatcher watcher;          // null when the watch failed
     private static RenderDocLabels labels;
     private static FrameContext frame;
+    /** The live world's biomes, and the widened seam baked from them each rebuild. */
+    private static WorldBiomeSource biomes;
+    private static BiomeSeamVolume seamVolume;
+    private static long frameIndex;
+    private static boolean biomeReceiptLogged;
     private static PackManifest manifest;
     private static PipelineProvider pipelines;
     private static CompiledGraph graph;
@@ -202,6 +209,11 @@ public final class RendererLoop {
         // After beginFrame (previous-frame snapshot first), before the graph:
         // the pack's passes read the frame context this call fills.
         FrameBridge.fill(frame, client, fbWidth, fbHeight);
+        // The world's BIOMES reach the graph here too: the player's surroundings
+        // are read into a field, baked into the widened seam, and bound so the
+        // graph's freshness gate has a record it did not invent (r58). Cheap
+        // when nothing changed - a rebuild needs a cell crossing and 20 frames.
+        updateBiomes();
         GfxCommandBuffer cmd = device.createCommandBuffer(QueueType.GRAPHICS);
         cmd.begin();
         labels.beginFrame(cmd);
@@ -217,6 +229,62 @@ public final class RendererLoop {
         // needs no readback: its texture already is the blit source.
         presentReadPending = presentEnabled
                 && device.backendType() == BackendType.VULKAN_13;
+    }
+
+    /**
+     * The live world reaches the pack HERE: the player's surroundings are read
+     * into a {@link dev.auralite.render.biome.BiomeField}, baked into the
+     * widened seam, and bound to the frame so the graph's freshness gate has a
+     * record to check.
+     *
+     * <p>Before this existed the fabric lane never filled a field at all, so
+     * every live frame baked an empty volume and the seam could not appear
+     * however correct the bake was. The synthetic split the GPU lane uses is a
+     * fixture; this is the terrain the player is standing on.
+     *
+     * <p>Cheap when nothing changed: the field is rebuilt only when the player
+     * crosses a cell boundary and no more often than
+     * {@link dev.auralite.render.biome.BiomeWindowSource#MIN_FRAMES_BETWEEN_REBUILDS}
+     * frames, and the bake runs only on a rebuild or when the volume has no
+     * record yet.
+     */
+    private static void updateBiomes() {
+        frameIndex++;
+        MinecraftClient client = MinecraftClient.getInstance();
+        if (frame.biomeVolume("biome_volume") != null && biomes == null) return;   // pack wants none
+        if (biomes == null) {
+            biomes = new WorldBiomeSource(BiomeRegistry.vanillaDefaults());
+        }
+        if (client == null || client.player == null || client.world == null) return;
+        double px = client.player.getX();
+        double py = client.player.getY();
+        double pz = client.player.getZ();
+        int changed = biomes.updateFrom(client.world, px, py, pz, frameIndex);
+
+        // The volume object is reused across frames: a bake allocates two int
+        // arrays the size of the window, and doing that per frame would hand
+        // the collector 400 kB every 20 frames for no new information.
+        if (seamVolume == null) {
+            seamVolume = new BiomeSeamVolume(biomes.field());
+        }
+        if (changed == 0 && seamVolume.bakeNanos() > 0 && frame.biomeVolume("biome_volume") != null) {
+            return;
+        }
+        seamVolume.radius(manifest != null ? manifest.biomeSeamRadius : 2);
+        seamVolume.bake(biomes.registry());
+        frame.bindBiomeVolume("biome_volume", seamVolume);
+
+        // The volume the GPU holds is not the volume the CPU just baked until
+        // someone uploads it, and the host is that someone. The upload itself
+        // happens in the graph's allocate path today (the pack declares the
+        // resource); what is recorded here is the fact the gate must not
+        // guess: this bake is the one the frame is allowed to read.
+        if (!biomeReceiptLogged) {
+            biomeReceiptLogged = true;
+            AuraLiteRenderMod.LOGGER.info("biome/bake: {} | {} | {} ids packed ({} B), {} weights",
+                    biomes.receipt(), volume.receipt(),
+                    volume.ids().length, volume.ids().length * 4L, volume.weights().length);
+        }
     }
 
     /**

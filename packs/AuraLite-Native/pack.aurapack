@@ -19,15 +19,17 @@ optional = RAY_QUERY
 [biome]
 spatialUniforms = true
 sampleEntries = 4
+seamRadius = 2
 
 [resources]
-scene_color  = rgba16f fullscreen
+scene_color  = rgba16f fullscreen usage=color|sampled
 scene_depth  = d32_sfloat fullscreen usage=depth|sampled
 ao           = r16f scaled=0.5 usage=storage|sampled
-taa          = rgba16f fullscreen history
+taa          = rgba16f fullscreen history usage=color|sampled
 backbuffer   = rgba8_unorm fullscreen imported usage=color|present
 scene        = rgba8_unorm fullscreen imported usage=storage
-biome_volume = rgba8_uint biome-volume 3d usage=sampled|storage
+biome_volume = r32g32_uint biome-volume 3d usage=sampled|storage
+biome_field_ids = r32_uint biome-volume 3d usage=sampled|storage
 
 [options]
 CLOUD_QUALITY = select "Raymarch steps" { 14=Cheap, 24=Standard, 36=High } default=24 tab=Atmosphere
@@ -38,7 +40,7 @@ DEBUG_VIEW = const "Debug view" default=0 tab=Lighting
 [graph]
 pass shadow_map raster depth=scene_depth program=shadow
 pass terrain raster color=scene_color depth=scene_depth read=biome_volume program=terrain
-pass biome_field compute write=biome_volume program=biome_field dispatch=ceil(width/8),ceil(height/8),1
+pass biome_field compute write=biome_volume read=biome_field_ids program=biome_field dispatch=ceil(width/8),ceil(height/8),1
 pass ssao compute write=ao read=scene_depth program=ssao dispatch=ceil(width/16),ceil(height/16),1 when=SSAO
 pass taa_resolve raster read=scene_color,ao,taa.prev color=taa.cur program=taa
 pass present raster read=taa.cur,scene color=backbuffer external program=final

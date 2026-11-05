@@ -53,12 +53,14 @@ public final class GlPipelineProvider implements PipelineProvider {
         PackProgram p = pack.program(programName);
         GfxDesc.GraphicsPipeline desc = new GfxDesc.GraphicsPipeline().named(programName);
         if (p != null && p.stage(GfxStage.VERTEX) != null) {
-            GfxShaderModule vs = device.createShaderModule(optionDefines(p.stage(GfxStage.VERTEX)));
+            GfxShaderModule vs = device.createShaderModule(
+                    pack.withOptionDefines(p.stage(GfxStage.VERTEX)));
             modules.add(vs);
             desc.stage(vs);
         }
         if (p != null && p.stage(GfxStage.FRAGMENT) != null) {
-            GfxShaderModule fs = device.createShaderModule(optionDefines(p.stage(GfxStage.FRAGMENT)));
+            GfxShaderModule fs = device.createShaderModule(
+                    pack.withOptionDefines(p.stage(GfxStage.FRAGMENT)));
             modules.add(fs);
             desc.stage(fs);
         }
@@ -75,11 +77,11 @@ public final class GlPipelineProvider implements PipelineProvider {
 
         PackProgram p = pack.program(programName);
         if (p == null || p.stage(GfxStage.COMPUTE) == null) return null;
-        GfxShaderModule cs = device.createShaderModule(optionDefines(p.stage(GfxStage.COMPUTE)));
+        GfxShaderModule cs = device.createShaderModule(
+                pack.withOptionDefines(p.stage(GfxStage.COMPUTE)));
         modules.add(cs);
         GfxPipeline pipe = device.createComputePipeline(GfxDesc.ComputePipeline
-                .of(cs)
-                .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
+                .of(cs)                .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
                 .named(programName));
         cache.put(key, pipe);
         return pipe;
@@ -89,28 +91,6 @@ public final class GlPipelineProvider implements PipelineProvider {
     public boolean has(String programName) {
         PackProgram p = pack.program(programName);
         return p != null && p.stageCount() > 0;
-    }
-
-    /**
-     * The stage with the pack's active option defines prepended - the option
-     * lane (bool/select/slider/const) reaching the GLSL compiler. SPIR-V
-     * sources pass through untouched: they were already compiled against a
-     * fixed option set and cannot take preprocessor defines.
-     */
-    private ShaderSource optionDefines(ShaderSource src) {
-        if (src == null || src.kind() != ShaderSource.Kind.GLSL) return src;
-        // activeDefines() hands out complete "#define NAME value" lines for
-        // direct emission; withDefines() takes the bare "NAME value" token
-        // and prepends "#define " itself. Passing the line through unchanged
-        // yields "#define #define ..." - C0105 on every option line, which
-        // only a real GLSL compiler (the player's GPU, gpu-test) sees; the
-        // NULL device validates structure only.
-        java.util.List<String> bare = new java.util.ArrayList<String>();
-        for (String line : pack.activeDefines()) {
-            if (line.startsWith("#define ")) line = line.substring("#define ".length());
-            if (!line.isEmpty()) bare.add(line);
-        }
-        return bare.isEmpty() ? src : src.withDefines(bare);
     }
 
     /** Called on pack reload/resize: pipelines are pack- and size-bound. */    public void invalidate() {

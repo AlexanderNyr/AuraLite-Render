@@ -138,6 +138,20 @@ public final class NativePackParser {
                         report.error(where, "sampleEntries must be 1..4, got " + value);
                     }
                 } catch (NumberFormatException e) { report.error(where, "sampleEntries is not an integer"); }
+            } else if (key.equals("seamRadius")) {
+                try {
+                    int r = Integer.parseInt(value.trim());
+                    if (r < 0 || r > dev.auralite.render.biome.BiomeSeam.MAX_RADIUS) {
+                        // Refused, never clamped: see BIOME_PLAN, "Refusals, by name".
+                        report.error(where, "BIOME_SEAM_R_TOO_WIDE: seamRadius " + value
+                                + " is outside 0.." + dev.auralite.render.biome.BiomeSeam.MAX_RADIUS
+                                + " (the pass declares its maximum; nothing is clamped)");
+                    } else {
+                        m.biomeSeamRadius = r;
+                    }
+                } catch (NumberFormatException e) {
+                    report.error(where, "BIOME_SEAM_R_TOO_WIDE: seamRadius '" + value + "' is not an integer");
+                }
             } else report.warning(where, "unknown [biome] key '" + key + "'");
             return;
         }
@@ -393,6 +407,13 @@ public final class NativePackParser {
             else if (k.equals("write") || k.equals("writes")) addAll(p.writes, v);
             else if (k.equals("program")) p.program = v;
             else if (k.equals("when")) p.when = v;
+            else if (k.equals("dispatchBase") || k.equals("dispatch_base")) {
+                if (v.equals("write") || v.equals("target")) p.dispatchBase = "write";
+                else if (v.equals("framebuffer") || v.equals("screen")) p.dispatchBase = "";
+                else report.warning(where, "pass '" + p.name + "' has unknown dispatchBase '"
+                        + v + "' (use write or framebuffer)");
+                continue;
+            }
             else if (k.equals("dispatch")) {
                 if (v.contains("(") || v.contains("width") || v.contains("height")) {
                     p.dispatchExpr = v;

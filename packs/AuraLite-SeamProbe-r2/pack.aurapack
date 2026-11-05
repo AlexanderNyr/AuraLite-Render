@@ -1,0 +1,40 @@
+# AuraLite seam probe pack.
+#
+# One job: prove on real hardware that the widened biome seam reaches the
+# screen. The reference pack writes the biome volume but nothing samples it, so
+# its pixel hash cannot move when the seam widens - this pack closes that gap.
+#
+# The frame is deliberately trivial: the host uploads the exact-id field, the
+# compute pass bakes the widened volume, and the present pass paints it. Two
+# sibling packs are generated from this one (SEAM_R and BIOME_SEAM_R), so a
+# pair of runs differs in the radius and in nothing else - that is the gate.
+
+[meta]
+name = AuraLite Seam Probe
+version = 1.0.0
+author = AuraLite-Render
+description = Widened biome seam, sampled and drawn - the B5 pixel gate
+auralite.api = 1
+
+[capabilities]
+require = COMPUTE_SHADERS, TEXTURE_3D, INTEGER_TEXTURES
+optional = RAY_QUERY
+
+[biome]
+spatialUniforms = true
+sampleEntries = 4
+seamRadius = 2
+
+[resources]
+biome_volume    = r32g32_uint biome-volume 3d usage=sampled|storage|transfer-src
+biome_field_ids = r32_uint biome-volume 3d usage=sampled|storage|transfer-src
+backbuffer      = rgba8_unorm fullscreen imported usage=color|present
+
+[graph]
+pass bake compute write=biome_volume read=biome_field_ids program=biome_field dispatchBase=write dispatch=ceil(width/8),ceil(height/8),depth
+pass show raster color=backbuffer read=biome_volume external program=seam_show
+present = backbuffer
+
+[programs]
+biome_field = shaders/biome_field.comp local_size=8x8x1
+seam_show = shaders/seam_show.vert, shaders/seam_show.frag

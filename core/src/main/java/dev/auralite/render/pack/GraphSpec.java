@@ -80,6 +80,17 @@ public final class GraphSpec {
         public int dispatchX, dispatchY, dispatchZ;
         /** Dispatch expressed as an expression of width/height, e.g. "ceil(width/8)". */
         public String dispatchExpr = "";
+        /**
+         * What {@code width}/{@code height} MEAN in {@link #dispatchExpr}.
+         *
+         * <p>Default is the framebuffer, which is right for a screen-sized pass
+         * and wrong for a bake: a 23x97x23 volume dispatched from a 1920x1080
+         * framebuffer asks for 240x135x1 groups, so 217 rows of invocations
+         * fall outside the image and the top of the volume is never written.
+         * {@code dispatchBase = write} sizes the expressions from the first
+         * {@code write=} target instead, which is the image the pass is filling.
+         */
+        public String dispatchBase = "";
         public String comment = "";
 
         public PassSpec(String name) { this.name = name; }

@@ -22,6 +22,16 @@ public final class BiomeField {
     /** Blocks per cell edge. Minecraft's biome container granularity. */
     public static final int DEFAULT_CELL_SIZE = 4;
 
+    /**
+     * The world's bottom block, on the y axis Minecraft 1.18+ uses.
+     *
+     * <p>A chunk column is indexed by block y from here, which is why a window
+     * that reaches below y = -64 would be addressing rows the world does not
+     * have. Naming the constant here - rather than burying -64 in the reader -
+     * is what lets the window arithmetic and the world agree on one frame.
+     */
+    public static final int MIN_BLOCK_Y = -64;
+
     private final int cellSize;
     private int originCX, originCY, originCZ;
     private int sizeCX, sizeCY, sizeCZ;

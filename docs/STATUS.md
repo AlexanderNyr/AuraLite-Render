@@ -9,13 +9,13 @@ Every number below is measured by `make test`, not estimated.
 rhi         51 passed   0 failed   0 NC   PASS
 graph       90 passed   0 failed   1 NC   PASS
 uniform     91 passed   0 failed   0 NC   PASS
-biome      142 passed   0 failed   1 NC   PASS
+biome      277 passed   0 failed   4 NC   PASS
 nulldev    115 passed   0 failed   0 NC   PASS
-pack       165 passed   0 failed   0 NC   PASS
+pack       209 passed   0 failed   0 NC   PASS
 tables     340 passed   0 failed   0 NC   PASS
 fabric      30 passed   0 failed   0 NC   PASS
 view         69 passed   0 failed   1 NC   PASS
-TOTAL 1093 passed, 0 failed, 3 negative controls, 9/9 suites green
+TOTAL 1272 passed, 0 failed, 6 negative controls, 9/9 suites green
 RESULT: PASS
 ```
 
@@ -583,6 +583,314 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   green - the roadmap's rule, kept.
   Gates after the doc work: `make test` 1093/0 9/9, `make drift-check`
   PASS.
+
+  r46 takes Phase 6's first code step - and only the first one. B5's plan
+  said gate 1 comes before any shader, so the widened seam exists first as
+  a CPU reference (`core/.../biome/BiomeSeam.java`) that states the rule in
+  one place: a `(2R+1)^3` box of cells, a per-axis tent weight
+  `max(0, R + 1 - |d|)`, duplicate ids merged, sorted by weight descending
+  with ties broken by ascending id - the tie-break is not cosmetic, it is
+  what lets a compute shader reproduce the same order - the top four kept and
+  renormalised, all-unknown cells yielding an empty set, and a radius past
+  four refused by name (`BIOME_SEAM_R_TOO_WIDE`) rather than silently
+  clamped. The load-bearing decision is what `R = 0` means: not "sample the
+  field at an arbitrary point" but "one cell, one id", which is exactly what
+  `BiomeSampler` already does at a cell centre - so the widening is a
+  strict extension of today's lookup, not a second opinion about it.
+  Gate 1 is measured, not argued. Walking every cell of a border field,
+  `BiomeSeam` at radius 0 reproduces `BiomeSampler.sampleCellCentre` at
+  **all of them**: 0 mismatches in count, id or weight (1e-6). The width
+  itself is receipted two ways: `seamWidthBlocks` reports 4 blocks at R = 0
+  and 20 at R = 2, and a probe along 25 positions across a border counts
+  blended positions - 4 for the sampler, 16 for the widened rule. Weight
+  invariants (sum to 1, descending) hold at every radius 0..4, the blow-up is
+  bounded and reported (`729` cells folded per output cell at the maximum
+  radius, which is the budget the compute pass has to respect), and the
+  refusal is checked by name.
+  Gates after step 1: `make test` 1100/0 9/9 (+7 checks, all in the biome
+  suite), `make gpu-test LANE=vk` unchanged (`sha 90f1a0c4...` - no render
+  path touched, which is the point). Still owed, and deliberately not
+  started here: the compute producer, `BIOME_SEAM_R` in `PACK_FORMAT`,
+  `BIOME_VOLUME_IDS_OVER_TOPK`, `BIOME_VOLUME_STALE`, the fetch-count
+  receipt and the GT 710 pixel hash.
+
+  r47 is B5's second step: the producer, and the plan's remaining gates.
+  `biome_field.comp` stops being a constant. It reads `biome_field_ids`
+  (`r32_uint`, the exact ids) and writes `biome_volume` (`rgba8ui`, four
+  packed ids in .x and four packed weights in .y) with `BiomeSeam`'s rule,
+  once per baked cell instead of once per fragment.
+  The decision worth recording is that the shader is GENERATED. A GLSL copy
+  of the rule is a second implementation in a second language, and gate 1
+  exists precisely because such copies drift while still compiling and still
+  rendering - so `BiomeSeamShader` emits the text, `make shader` writes it,
+  and `make shader-check` fails by name with the first differing line when
+  the committed file and the generator disagree. The shader is still checked
+  in: the pack must load with no toolchain and no network, which is the rule
+  every other pack asset follows. `seamRadius` becomes a `[biome]` key
+  (default 2, ceiling 4) and a pack past the ceiling is refused at load as
+  `BIOME_SEAM_R_TOO_WIDE` with the words "nothing is clamped" - the plan's
+  refusal, spelled the same way in the parser and in core.
+  The gates are receipts, not claims. At R = 0 the emitted volume is
+  BYTE-IDENTICAL to the TOPK packer's output over a border field: 0 id bytes
+  and 0 weight bytes differ across 256 cells, which is a much stronger
+  statement than the 1e-6 weight comparison gate 1 settled for, and it is
+  available because both layouts quantise with the same remainder rule. Width
+  at R = 2: 16 blended positions along the border line against 0 at R = 0, in
+  a 20-block band. Determinism is proven the rude way as well as explained:
+  two bakes agree byte for byte, and REVERSING the row order of the input
+  moves no texel - the sums are integers (largest possible total 15,625, far
+  below 2^24) so float32 holds them exactly, and the comparator fixes the
+  only thing order could have changed.
+  Both volume refusals are now code. `BIOME_VOLUME_IDS_OVER_TOPK`: an id a
+  byte cannot carry is never truncated into a different biome - the host bake
+  throws by name, and the shader marks that cell as a hole (255, zero
+  weights) because a compute invocation cannot throw and an invented id is
+  worse than an honest one. The refusal is per cell, not per volume: a wide
+  id taints exactly the cells whose box reaches it, which the suite pins down
+  as 2 of 4 in its fixture. `BIOME_VOLUME_STALE`: `BiomeSeamFreshness`
+  compares the field's version with the version last baked and refuses a read
+  by name, counting the refusal; a re-bake clears it. This is the failure
+  mode the plan called the dangerous one - a stale seam looks plausible - so
+  it is loud and it has a negative control standing in for "remove the check
+  and the suite must go red". There are now three such controls on this lane,
+  and five host-wide.
+  Cost, stated as the plan demanded a number: the fragment path goes from 28
+  fetches per sample (8 field + 20 LUT rows) to 21 (1 volume + 20 LUT) while
+  the seam gets WIDER, and the bake's private table is 125 int/float pairs at
+  R = 2 and 729 at the ceiling.
+  Gates: `make test` 1178/0, 5 negative controls, 9/9 (biome 212, pack 180);
+  `make shader-check` PASS on a 4,376-char shader; `glslangValidator -V`
+  compiles it to SPIR-V (8,720 B) with no diagnostics; `make packlint
+  PACK=packs/AuraLite-Native STRICT=1 NULL_DEVICE=1` OK, and it noticed on
+  its own that the pack now requires INTEGER_TEXTURES; `make drift-check`
+  PASS; `gpu-test LANE=vk` RENDERED with the SAME hash as r46
+  (`90f1a0c4...`), which is the correct result and not a shortfall - nothing
+  samples `biome_volume` yet, so a changed hash would have meant the bake
+  leaked into the frame.
+  What r47 does not claim: the staleness gate is not yet called from
+  `PackGraphBuilder`, the volume's height is still the framebuffer's rather
+  than the field's (the graph is built before any field is bound, so it has
+  only the cell extent), and no pass reads the widened volume. Those are the
+  first three items of B5's step 3, named rather than implied.
+
+  r48 is B5's step 3, and it opens with a correction. r47's STATUS claimed the
+  volume's height was "still the framebuffer's rather than the field's". That
+  was wrong, and a re-probe says so plainly: `[resources]` declares
+  `biome-volume`, whose extent is the field's cell extent, so the volume was
+  23x97x23 in the probe and always had been. The gap was never the extent - it
+  was that nothing read the volume. Correcting this in the same breath as
+  closing it is the point of keeping receipts: a wrong "owed" line is a defect
+  in the record, even when the code is fine.
+  The read side is now `BiomeSeamSampler`: bilinear between the eight baked cell
+  centres, entries merged by id, renormalised over the top four, holes
+  contributing nothing, positions outside the volume absent rather than clamped.
+  It reads the volume UNFILTERED on purpose, and this is the design decision
+  worth stating: a linear sampler would interpolate the packed id BYTES, and
+  the average of ids 12 and 40 is neither - slot order would be destroyed and
+  ids invented. So the contract is "fetch a texel, interpolate the unpacked
+  entries", which is also why the executor's storage-image-only bridge is
+  sufficient for the read side and no sampler unit is needed.
+  `BiomeSeamVolume` ties the arrays to the field they came from - extent from
+  the field by construction, bake recording the version it saw, a read after any
+  field write refusing as `BIOME_VOLUME_STALE` - and the refusal is now wired
+  where the plan wanted it: a graph pass that READS a `biome-volume` resource
+  calls the gate before recording a single command. That is the difference
+  between a tested tracker and a gate.
+  Writing that gate is also where this revision caught a real design flaw in
+  its own first attempt: the producer pass marked the volume current when it
+  dispatched. The suite failed immediately, and rightly - a dispatch proves a
+  pass ran, not that the GPU's copy matches the field the CPU holds, and that
+  depends on an upload the graph never sees. A gate that certifies itself is the
+  one failure mode worth designing against, so the mark now belongs to whoever
+  actually baked and the graph only refuses to read past it. The failing test is
+  why the code is correct; it is recorded rather than quietly fixed.
+  Gates: at EVERY cell centre of the 23x97x23 window the read returns that
+  cell's single id at weight 1 (0 misses); the read blends between centres at
+  R = 0 and blends at strictly more positions at R = 2 on the same
+  quarter-block line; every non-empty read sums to 1 with entries in descending
+  weight order; a position outside the volume is empty, not clamped; and
+  running the reference pack's own graph over a volume whose field moved since
+  the bake throws `BIOME_VOLUME_STALE` by name, through the pass body.
+  Gates after step 3: `make test` 1199/0, 5 negative controls, 9/9 (biome 229,
+  pack 184); `make shader-check` PASS (the emitted shader did not move, so the
+  generated artefact is stable across a core change); `packlint --strict
+  --null-device` OK.
+  Still owed, named with reasons: no host bake runs in the live frame path; no
+  pack pass samples `biome_volume`, so the 28 -> 21 fetch receipt remains a
+  statement about the design; and the descriptor bridge still binds storage
+  images only, which is enough for the unfiltered read this lane wants and
+  insufficient for a pack that asks for a combined sampler.
+
+  r49 builds the thing that was missing and does NOT get to close B5: the
+  seam needed a frame where it is actually sampled, so there is now a probe
+  pack (`packs/AuraLite-SeamProbe`) that uploads the exact-id field, bakes it
+  in compute and paints the result unfiltered, plus two generated siblings
+  (-r0, -r2) that differ in the radius and nothing else.
+  Building it found three real defects, and none of them was in the seam.
+  First: PACK OPTIONS WERE NEVER COMPILED WITH. `activeDefines()` has been
+  tested since the options lane landed and no compiler ever consumed its
+  output, so every `[options]` value in every pack was inert inside every
+  shader - and `seamRadius` could not reach the bake at all. The receipt was a
+  probe run at R=0 and a run at R=2 producing byte-identical pixels, with the
+  shader's own default of 2 in force both times. Fixed in core (`PackDefines`
+  inserts the manifest's defines after `#version` and refuses a shader with no
+  version line by name) and in the generated shader, which now reads
+  `BIOME_SEAM_R` as a define with the plan's 2 as its fallback.
+  Second: `dispatch=` had no way to say "the image I am filling". A bake over
+  a 23x97x23 volume was dispatched from the 1920x1080 framebuffer as
+  240x135x1 groups - every invocation past the image did nothing, and the
+  depth term silently evaluated to 1, so only layer 0 was ever written. Now
+  `dispatchBase=write` plus a `depth` binding sizes a compute pass from its
+  target (3x13x23 for this volume), and the pack suite pins all three numbers.
+  Third: the volume's format was 8 bits wide and the bake is 32. Written up
+  in r55 as a layout bug ("the upload leaves the image in SHADER_READ_ONLY,
+  so every `imageStore` is discarded"), and THAT DIAGNOSIS WAS WRONG. It was
+  measured and refuted on 2026-11-04 with a layout trace: the volume goes
+  `UNDEFINED -> STORAGE_WRITE -> GENERAL` before the bake and
+  `STORAGE_WRITE -> SHADER_READ -> SHADER_READ_ONLY` before the draw, three
+  times a frame, exactly as designed. The real cause is narrower and had been
+  in front of every one of those runs: the bake computes `packedIds` (four
+  ids in one 32-bit word) and stores it in `.x` of an `rgba8ui` image, and an
+  integer narrowing write SATURATES rather than truncates - a probe that
+  stored `0xFFFFFF06` read back `ff`, and one that stored `0x12345678` also
+  read back `ff`. Slot 0 survived only while the word happened to be one
+  byte; slots 1..3 were always 255, which the fragment reads as
+  `UNKNOWN_SLOT` and skips, so a correctly baked and correctly uploaded
+  volume painted nothing. The format is now `r32g32_uint` (the contract the
+  code already stated: four ids in `.x`, four weights in `.y`), in both the
+  pack declarations and the generated shader.
+  WHAT IS && IS NOT CLAIMED. With the format fixed the B5 pixel gate CLOSES
+  on the Vulkan lane, and it is a gate and not an anecdote because the same
+  two commands give two hashes, twice in a row, on an unmodified checkout:
+  `packs/AuraLite-SeamProbe-r0` -> `sha256=051df21086e91b1d...` (2780640
+  nonzero pixels) and `-r2` -> `sha256=0cc14ba8f791f11e...` (2842560) - the
+  seam widening moves 61 920 pixels. The host's own readback of the volume
+  agrees with what the fragment fetches: the centre cell is `0xFFFF0601` ids
+  and `0x000055AA` weights, i.e. swamp id 6 at 85/255 and plains id 1 at
+  170/255, which is the widened seam itself and not a flat cell. Still NOT
+  claimed: the same gate on the GL lane (it renders, but its volume readback
+  refuses outside the RGBA8 family and both radii hash the same, so that
+  lane's pixel evidence is unproven) and the live host frame path (no
+  Fabric session has been run with the bake in the frame loop).
+  One more receipt worth keeping: the probe's first present pass omitted
+  `external`, and the graph culled the whole chain (`pass order []`). A pass
+  that touches the imported backbuffer has to say so; the compiler caught it.
+  THE GL LANE, r57. Closing the same gate on GL found two more defects, and
+  neither was in the seam:
+  First: the GL backend bound a storage image with `format = 0` ("whatever the
+  texture already is"). GL accepts that, and then refuses the image at draw
+  time for a 32-bit integer image declared as `rg32ui` - so the shader read a
+  binding that was never valid, `imageSize()` returned 0, and the fragment
+  painted nothing. Diagnosed by dumping the draw-time binding state (`fmt` was
+  0x8D7C = RGBA8UI on an RG32UI image) and then by asking GL to name its own
+  error per argument: the same call with the texture's real internal format is
+  clean. The backend now passes `GlFormatTable.of(format).internalFormat`.
+  Second, and this one was core's: the pack's option defines reached the Vulkan
+  provider and NOT the GL one, so `BIOME_SEAM_R` stayed at the shader's
+  fallback of 2 on GL and both probe packs rendered the same picture. Measured
+  by running the pair on the GL lane: two packs, one hash. The application now
+  lives in one place (`PackManifest.withOptionDefines`) that both providers and
+  the GPU harness call, and the pack suite pins it (`pack` 196 -> 200).
+  With both fixed the two lanes agree, hash for hash:
+  `-r0` `051df21086e91b1d...` (2780640 nonzero) in BOTH, `-r2`
+  `0cc14ba8f791f11e...` (2842560) in BOTH - and the reference pack's own hashes
+  are unchanged (`149d2b37...` vk, `5b4ed44e...` gl), so the fixes moved nothing
+  that was already correct.
+  THE LIVE WORLD, r58. The host frame path never filled a biome field, so
+  every fabric frame baked an empty volume and the seam could not appear
+  however correct the bake, the format and the barriers were. `WorldBiomeSource`
+  now reads one biome per cell from the loaded chunks around the player,
+  `BiomeWindowSource` (core) owns the window arithmetic - origin, cell
+  crossings, the 20-frame throttle, and UNKNOWN for unloaded chunks, with
+  "unloaded" and "unmapped biome" counted apart - and `RendererLoop` bakes the
+  seam from that field and binds it to the frame, so the freshness gate gets a
+  record the host produced rather than one the graph assumed.
+  Two defects fell out of wiring it, both measured:
+  first, `frameIndex - lastBuildFrame` overflows at `Long.MIN_VALUE`, so a
+  first-ever update looked throttled forever (the suite caught it with a fresh
+  counter); second and bigger, the window starts at NEGATIVE cells for a player
+  near the origin - origin cell (-11,-32,-11) at (0,64,0) - and
+  `BiomeSeamSampler` read every world position as if the volume began at cell
+  0. A border at z = 0 therefore read as a flat swamp and the inside of that
+  swamp as nothing at all. The sampler takes the window's origin now and the
+  volume passes the field's: the border returns two biomes at 0.5/0.5 and the
+  interior exactly one.
+  Cost, because it decides the throttle: 51 313 lookups and a 51 ms bake on
+  this host, so the window rebuilds on a cell crossing and at most every 20
+  frames. NOT claimed: a receipt from a real Minecraft session - the windowed
+  gate needs a JDK 21, a GPU and a world, and standing rule 4 says no frame is
+  claimed until one has been.
+  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  `make shader-check` PASS on three packs; `packlint --strict --null-device`
+  OK on all three (the probe and its siblings; the reference pack also now
+  receives a host-uploaded 23x97x23 field, and its hash is unchanged because
+  no pass samples that volume - correctly inert); `gpu-test LANE=vk` RENDERED
+  with the same hash as before.
+
+  THE FRAME READS THE SEAM, r59. That "correctly inert" line above was the last
+  honest sentence of a pack that did not work: `terrain` declared
+  `read=biome_volume`, no shader touched a texel, and every gate stayed green
+  because none of them could see the difference. What had to be true first:
+  - the descriptor bridge bound STORAGE images only and threw on a combined
+    sampler, so a sampled read could not even bind. It binds now, with an
+    explicit nearest-clamp sampler - nearest because filtering interpolates the
+    packed id bytes, and the average of two ids is a third id;
+  - a history resource has two spellings (`taa.cur` in the manifest, `taa_cur`
+    in GLSL - a uniform name cannot hold a dot) and one phase, and resolving it
+    at BIND time answered with the frame's other side. Resolution happens once,
+    at build time, for both spellings;
+  - three of the four reference stages were stubs: `terrain.vert` emitted all
+    three vertices at the origin (zero area, zero fragments), `taa.frag` and
+    `final.frag` drew a gradient of `gl_FragCoord` and ignored their inputs. A
+    red terrain stage changed no pixel, which is exactly what a chain that
+    carries nothing looks like.
+  The gate is the one the plan asked for and it can fail: the same frame,
+  twice, differing only in what the host put in the source field, must draw
+  differently. Split field `c635d4906ec10a94`, uniform field `4a75f3b149347026`,
+  byte-identical on Vulkan and GL. The smoke refuses to say RENDERED if the two
+  hashes agree.
+  Two more defects surfaced under the same symptom, both on the GL lane and both
+  real: sampler uniforms were never assigned a texture unit, so any sampled
+  binding other than 0 read whatever sat on unit 0 (the present pass worked by
+  coincidence of `set * SET_STRIDE + binding`); and a `DONT_CARE` depth
+  attachment kept the previous pass's contents, so a fullscreen triangle at
+  `gl_Position.z = 0` lost the depth test and wrote nothing. Samplers are
+  pointed at their unit after link, and a depth attachment the graph did not ask
+  to preserve is cleared - the semantics Vulkan already had.
+  Two corrections to the plan itself: the bake fills slice 0 only
+  (`ceil(width/8) x ceil(height/8) x 1` groups), so reading the volume's middle
+  slab reads a slab nobody wrote; and `scene_color` is a render target, so a
+  stage that wants it declares `sampler2D` against `usage=color|sampled`.
+  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  `make shader-check` PASS; `make drift-check` PASS; `gpu-test LANE=vk` and
+  `LANE=gl` both RENDERED with the same hash, and the volume-driven receipt
+  printed on both.
+
+  THE WINDOW MEETS A REAL SHAPE, r60. Step 7 read the live world one BLOCK at a
+  time - 51 313 lookups through the chunk cache, each of which is allowed to
+  generate terrain on the render thread. The reader is column-shaped now: 529
+  calls, one chunk each, from the chunk the client already has, and the field is
+  identical cell for cell. Three things fell out:
+  - a 97-cell window of 4-block cells is 388 blocks tall and the world is 384,
+    so 128 cells of the reference window address rows below y = -64. They are
+    counted holes, not repeated edge values (`BiomeField.MIN_BLOCK_Y` names the
+    bottom); the first test asserted "no holes", which is what a fixture that
+    never looked at the world says;
+  - a half-unloaded world stayed half-unloaded only after the contract was
+    split: "this sampler has columns" and "this column is not loaded" are two
+    different answers. Written as one, every missing chunk was quietly refilled
+    per block and the volume had zero holes - the opposite of an honest field;
+  - the seam is countable now. `BiomeSeamVolume` reports blended cells and
+    distinct ids and quotes them: one biome over a window bakes ZERO blended
+    cells at R = 2, a border bakes 256 of 512. A frame drawn from the first one
+    looks exactly like a working seam, which is why the number had to exist.
+  Also stated, and pinned by the pack suite: what a surface pixel means in the
+  reference pack - the weighted sum of the biomes the cell holds, so a blend is
+  visibly desaturated. NOT claimed: a session log. B5 stays open until one
+  exists (standing rule 4).
+  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  `gpu-test LANE=vk` and `LANE=gl` RENDERED with the same hash and the
+  volume-driven receipt on both.
 
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched

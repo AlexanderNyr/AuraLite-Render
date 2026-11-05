@@ -1,0 +1,108 @@
+#version 460
+// GENERATED FILE - do not edit by hand.
+// Source of truth: core/.../biome/BiomeSeamShader.java (regenerate with `make shader`).
+//
+// Reference pack: the biome seam is widened here, once per baked cell, so a
+// fragment fetches one texel instead of eight and still gets a wider blend.
+// The rule is BiomeSeam's: a tent kernel over a (2R+1)^3 box, duplicate ids
+// merged, top four by weight descending with ties by ascending id, then
+// renormalised and quantised to bytes, the last slot taking the remainder.
+//
+// Cost: a box of 125 cells at the reference pack's
+// R = 2, 729 at the maximum; the merge table is that many int/float
+// pairs of private storage per invocation, which is why this is a bake and
+// not a per-frame pass.
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(set = 0, binding = 0, rg32ui) uniform writeonly uimage3D biome_volume;
+layout(set = 0, binding = 1, r32ui) uniform readonly uimage3D biome_field_ids;
+
+#ifndef BIOME_SEAM_R
+#define BIOME_SEAM_R 2
+#endif
+const int BIOME_SEAM_MAX_R = 4;       // BiomeSeam.MAX_RADIUS
+const int BIOME_SEAM_R_USED = BIOME_SEAM_R > BIOME_SEAM_MAX_R
+        ? BIOME_SEAM_MAX_R : BIOME_SEAM_R;
+const int BIOME_TOP_SLOTS = 4;      // BiomeSample.MAX_ENTRIES
+const int BIOME_BOX_CELLS = 729;     // (2 * MAX_R + 1)^3
+const uint BIOME_UNKNOWN_FIELD = 0xFFFFFFFFu;
+const uint BIOME_UNKNOWN_SLOT = 255u;
+const int BIOME_MAX_TOPK_IDS = 254;  // BiomeFieldPacker.MAX_TOPK_IDS
+
+void main() {
+    ivec3 dims = imageSize(biome_field_ids);
+    ivec3 c = ivec3(gl_GlobalInvocationID);
+    if (any(greaterThanEqual(c, dims))) return;
+
+    int ids[BIOME_BOX_CELLS];
+    float wsum[BIOME_BOX_CELLS];
+    int merged = 0;
+
+    // Clipped box: outside the volume nothing can contribute, which is
+    // what the CPU side calls an unknown cell.
+    ivec3 lo = max(ivec3(0), c - BIOME_SEAM_R_USED);
+    ivec3 hi = min(dims - ivec3(1), c + BIOME_SEAM_R_USED);
+    for (int z = lo.z; z <= hi.z; z++) {
+        int wz = BIOME_SEAM_R_USED + 1 - abs(z - c.z);
+        for (int y = lo.y; y <= hi.y; y++) {
+            int wy = BIOME_SEAM_R_USED + 1 - abs(y - c.y);
+            for (int x = lo.x; x <= hi.x; x++) {
+                int wx = BIOME_SEAM_R_USED + 1 - abs(x - c.x);
+                uint raw = imageLoad(biome_field_ids, ivec3(x, y, z)).r;
+                if (raw == BIOME_UNKNOWN_FIELD) continue;
+                int id = int(raw);
+                float w = float(wx * wy * wz);
+                int at = -1;
+                for (int j = 0; j < merged; j++) {
+                    if (ids[j] == id) { at = j; break; }
+                }
+                if (at < 0) { ids[merged] = id; wsum[merged] = 0.0; at = merged; merged++; }
+                wsum[at] += w;
+            }
+        }
+    }
+
+    // Top BIOME_TOP_SLOTS by weight descending, ties by ascending id: the
+    // same comparator as BiomeSeam, so the order is the same order.
+    int cnt = min(merged, BIOME_TOP_SLOTS);
+    int selIds[BIOME_TOP_SLOTS];
+    float selW[BIOME_TOP_SLOTS];
+    float total = 0.0;
+    for (int i = 0; i < cnt; i++) {
+        int best = -1;
+        for (int j = 0; j < merged; j++) {
+            if (ids[j] < 0) continue;
+            if (best < 0 || wsum[j] > wsum[best]
+                || (wsum[j] == wsum[best] && ids[j] < ids[best])) best = j;
+        }
+        selIds[i] = ids[best];
+        selW[i] = wsum[best];
+        total += wsum[best];
+        ids[best] = -1;
+    }
+
+    // BIOME_VOLUME_IDS_OVER_TOPK: an id a byte cannot carry is never
+    // truncated into a different biome - the cell becomes an honest hole.
+    bool overTopk = false;
+    for (int i = 0; i < cnt; i++) {
+        if (selIds[i] > BIOME_MAX_TOPK_IDS) overTopk = true;
+    }
+
+    // Quantise to bytes, the last slot taking the remainder so the four
+    // weights sum to 255 exactly - the packer's rule, so both layouts agree.
+    uint packedIds = 0u;
+    uint packedW = 0u;
+    int assigned = 0;
+    for (int k = 0; k < BIOME_TOP_SLOTS; k++) {
+        uint id = BIOME_UNKNOWN_SLOT;
+        int q = 0;
+        if (k < cnt && total > 0.0 && !overTopk) {
+            id = uint(selIds[k]);
+            int scaled = int(round(selW[k] / total * 255.0));
+            if (k < cnt - 1) { q = scaled; assigned += scaled; }
+            else q = max(0, 255 - assigned);
+        }
+        packedIds |= (id & 0xFFu) << uint(k * 8);
+        packedW |= (uint(q) & 0xFFu) << uint(k * 8);
+    }
+    imageStore(biome_volume, c, uvec4(packedIds, packedW, 0u, 0u));
+}

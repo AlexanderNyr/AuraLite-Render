@@ -6,6 +6,7 @@ import dev.auralite.render.graph.CompiledGraph;
 import dev.auralite.render.graph.GraphContext;
 import dev.auralite.render.graph.RenderGraph;
 import dev.auralite.render.pack.GraphSpec;
+import dev.auralite.render.pack.PackDefines;
 import dev.auralite.render.pack.PackFormat;
 import dev.auralite.render.pack.PackGraphBuilder;
 import dev.auralite.render.pack.PackLoader;
@@ -102,6 +103,20 @@ public final class PackSuite {
     static PackSource nativeSource() {
         PackSource.Memory m = new PackSource.Memory("<native-test-pack>");
         m.put("pack.aurapack", NATIVE_PACK);
+        for (String n : new String[] { "cloud_shadow", "terrain", "composite", "taa", "final" }) {
+            m.put("shaders/" + n + ".vert", VERT);
+            m.put("shaders/" + n + ".frag", FRAG);
+        }
+        m.put("shaders/shadow.vert", VERT);
+        m.put("shaders/ssao.comp", COMP);
+        return m;
+    }
+
+    /** The native test pack with one [biome] key added - nothing else differs. */
+    static PackSource withSeamRadius(String value) {
+        PackSource.Memory m = new PackSource.Memory("<seam-" + value + ">");
+        m.put("pack.aurapack", NATIVE_PACK.replace("sampleEntries = 4",
+                "sampleEntries = 4\nseamRadius = " + value));
         for (String n : new String[] { "cloud_shadow", "terrain", "composite", "taa", "final" }) {
             m.put("shaders/" + n + ".vert", VERT);
             m.put("shaders/" + n + ".frag", FRAG);
@@ -410,6 +425,129 @@ public final class PackSuite {
                 + lc.totalBarriers() + " barriers, 0 violations");
         lc.release();
 
+        section("pack options are defines, and a bake dispatches over its own extent");
+        // Found by a probe pack that changed its radius and rendered a
+        // byte-identical frame: options were collected and never compiled with,
+        // so every option was inert inside every shader.
+        eq(PackDefines.apply("#version 460\nvoid main() {}\n", null), "#version 460\nvoid main() {}\n",
+                "no defines leaves the source untouched");
+        String defined = PackDefines.apply("#version 460\n// body\nvoid main() {}\n",
+                java.util.Arrays.asList("#define A 1", "#define B 2"));
+        check(defined.startsWith("#version 460\n#define A 1\n#define B 2\n"),
+                "defines land directly after the version line, where GLSL allows them: " + defined);
+        check(defined.contains("// body"), "and the body survives");
+        TestRig.throwsNamed(new Runnable() {
+            @Override public void run() {
+                PackDefines.apply("void main() {}\n", java.util.Arrays.asList("#define A 1"));
+            }
+        }, "no #version line", "a shader without a version line is refused, not silently mis-prefixed");
+
+        // dispatchBase=write: a 3D bake must be sized by the image it fills.
+        PackLoader bakeLoader = new PackLoader(new PackSource.Directory(
+                java.nio.file.Paths.get("packs/AuraLite-SeamProbe")));
+        check(bakeLoader.load(null), "the seam probe pack loads: " + bakeLoader.report().errors());
+        PackManifest bm = bakeLoader.manifest();
+        GraphSpec.PassSpec bakePass = null;
+        for (GraphSpec.PassSpec p : bm.graph.passes()) {
+            if (p.name.equals("bake")) bakePass = p;
+        }
+        check(bakePass != null, "the probe pack declares its bake pass");
+
+        // Step 8: the reference pack's chain must actually MOVE data. Every
+        // stage of it used to write a function of gl_FragCoord and ignore its
+        // inputs, and the terrain stage emitted a triangle with all three
+        // vertices at the origin - zero fragments. The receipts were green
+        // (passes in order, 0 violations) and the frame was a gradient that
+        // nothing upstream could change. These checks pin the three facts that
+        // make the chain real, as text, because the pixel half lives in the GPU
+        // lane's own receipts.
+        section("reference pack: the frame chain carries its inputs");
+        PackLoader refLoader = new PackLoader(new PackSource.Directory(
+                java.nio.file.Paths.get("packs/AuraLite-Native")));
+        check(refLoader.load(null), "the reference pack loads: " + refLoader.report().errors());
+        PackManifest ref = refLoader.manifest();
+        PackProgram terrainProgram = ref.program("terrain");
+        check(terrainProgram != null, "the reference pack ships a terrain program");
+        boolean readsVolume = false;
+        for (PackProgram.ImageDecl d : terrainProgram.imageDecls()) {
+            if (d.name.equals("biome_volume")) readsVolume = true;
+        }
+        check(readsVolume, "and its terrain stage DECLARES biome_volume - the pass has said"
+                + " read=biome_volume since the seam's read side landed, while the shader"
+                + " never touched a texel");
+        PackProgram finalProgram = ref.program("final");
+        check(finalProgram != null, "and a present program");
+        boolean readsResolved = false;
+        for (PackProgram.ImageDecl d : finalProgram.imageDecls()) {
+            if (d.kind == dev.auralite.render.rhi.GfxDesc.PipelineLayout.Kind.COMBINED_IMAGE_SAMPLER) {
+                readsResolved = true;
+            }
+        }
+        check(readsResolved, "whose present stage SAMPLES the resolved frame instead of"
+                + " drawing a gradient of the screen position");
+        // The vertex stage must cover its area: three vertices at one point emit
+        // no fragments, which is a pass that runs and draws nothing.
+        String terrainVert = "";
+        try {
+            terrainVert = new String(java.nio.file.Files.readAllBytes(
+                            java.nio.file.Paths.get("packs/AuraLite-Native/shaders/terrain.vert")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            check(false, "terrain.vert is readable: " + e.getMessage());
+        }
+        TestRig.contains(terrainVert, "gl_Position = vec4(uv * 2.0 - 1.0",
+                "terrain.vert builds a fullscreen triangle, not a point at the origin");
+        check(!terrainVert.contains("vec4(0.0, 0.0, 0.0, 1.0)"),
+                "and no longer emits all three vertices at the origin (zero area, zero pixels)");
+        // "The seam is visible" must mean "the biome blend is visible", not "an
+        // id palette is visible". The reference pack states that rule in its own
+        // shader and this pins it, so the claim cannot quietly change meaning
+        // between a fixture and a live session.
+        String terrainFrag = "";
+        try {
+            terrainFrag = new String(java.nio.file.Files.readAllBytes(
+                            java.nio.file.Paths.get("packs/AuraLite-Native/shaders/terrain.frag")),
+                    java.nio.charset.StandardCharsets.UTF_8);
+        } catch (java.io.IOException e) {
+            check(false, "terrain.frag is readable: " + e.getMessage());
+        }
+        TestRig.contains(terrainFrag, "weighted sum of the colours of the biomes",
+                "terrain.frag states what a surface pixel means: the biome blend, weighted");
+        TestRig.contains(terrainFrag, "acc / wsum",
+                "and normalises by the weight it actually accumulated, so a blended cell is a"
+                        + " blend and a single-biome cell is that biome's colour");
+
+        eq(bakePass.dispatchBase, "write", "and sizes its dispatch from the volume it writes");
+        check(bm.activeDefines().contains("#define BIOME_SEAM_R 2"),
+                "the pack's [biome] seamRadius reaches the shaders as a define: " + bm.activeDefines());
+        // The define has to reach the COMPILER, not just the manifest, and it
+        // has to reach it on every backend. Two providers used to disagree:
+        // the Vulkan one applied the defines and the GL one did not, so the
+        // seam probe at radius 0 and at radius 2 hashed identically on the GL
+        // lane - a widened seam cannot do that, which is how it was caught.
+        dev.auralite.render.rhi.ShaderSource raw =
+                dev.auralite.render.rhi.ShaderSource.glsl(
+                        dev.auralite.render.rhi.GfxStage.COMPUTE,
+                        "#version 460\nvoid main() {}\n", "test");
+        dev.auralite.render.rhi.ShaderSource seamDefined = bm.withOptionDefines(raw);
+        check(!seamDefined.defines().isEmpty(),
+                "withOptionDefines actually adds the pack's defines to a stage");
+        check(seamDefined.preprocessed().contains("#define BIOME_SEAM_R 2"),
+                "and they end up in the source the compiler is handed");
+        eq(bm.withOptionDefines(null), null, "a stage that does not exist stays absent");
+        check(bm.withOptionDefines(raw) != raw,
+                "a defined stage is a new source, so a cached one cannot be mutated");
+        // The four values that matter to the gate: width, height, depth, and a bake
+        // that is NOT the framebuffer's.
+        dev.auralite.render.uniform.ExprEnv denv = new dev.auralite.render.uniform.ExprEnv(
+                new dev.auralite.render.uniform.FunctionTable());
+        int[] fromFramebuffer = PackGraphBuilder.resolveDispatch(bakePass, denv, 1920, 1080);
+        eq(fromFramebuffer[1], 135, "without a base, a 97-cell volume would get 135 rows of groups");
+        int[] fromVolume = PackGraphBuilder.resolveDispatch(bakePass, denv, 1920, 1080, new int[] { 23, 97, 23 });
+        eq(fromVolume[0], 3, "with dispatchBase=write the width comes from the volume (23 cells -> 3 groups)");
+        eq(fromVolume[1], 13, "and the height (97 -> 13)");
+        eq(fromVolume[2], 23, "and depth is the layer count, so every layer is written");
+
         section("refusals name their reason");
         PackSource.Memory noApi = new PackSource.Memory("<api>");
         noApi.put("pack.aurapack", NATIVE_PACK.replace("auralite.api = 1", "auralite.api = 99"));
@@ -419,6 +557,31 @@ public final class PackSuite {
         contains(apiLoader.report().errors().get(0), "requires API level 99",
                 "the refusal states the level it needs");
         contains(apiLoader.report().errors().get(0), "implements 1", "and the level this loader has");
+
+        // BIOME_PLAN B5: the seam radius is a [biome] key, refused by name past
+        // the ceiling the pass declares - never silently clamped.
+        PackLoader seamOk = new PackLoader(nativeSource());
+        check(seamOk.load(null), "a pack with no seamRadius still loads: " + seamOk.report().errors());
+        eq(seamOk.manifest().biomeSeamRadius, 2, "and gets the plan's default of 2 cells");
+
+        PackLoader seamLoader = new PackLoader(withSeamRadius("9"));
+        check(!seamLoader.load(), "a seamRadius past the maximum is refused");
+        contains(seamLoader.report().errors().get(0), "BIOME_SEAM_R_TOO_WIDE",
+                "the refusal names the code from the plan");
+        contains(seamLoader.report().errors().get(0), "outside 0.."
+                        + dev.auralite.render.biome.BiomeSeam.MAX_RADIUS,
+                "and states the range it enforces");
+        contains(seamLoader.report().errors().get(0), "nothing is clamped",
+                "and says outright that it did not clamp");
+
+        PackLoader seamTextLoader = new PackLoader(withSeamRadius("wide"));
+        check(!seamTextLoader.load(), "a non-integer seamRadius is refused, not ignored");
+        contains(seamTextLoader.report().errors().get(0), "BIOME_SEAM_R_TOO_WIDE",
+                "with the same code: one failure mode, one name");
+
+        PackLoader seamFourLoader = new PackLoader(withSeamRadius("4"));
+        check(seamFourLoader.load(), "the maximum itself is allowed: " + seamFourLoader.report().errors());
+        eq(seamFourLoader.manifest().biomeSeamRadius, 4, "and stored as declared");
 
         Set<GfxCapability> weak = EnumSet.of(GfxCapability.TEXTURE_3D);
         NullDevice weakDev = new NullDevice(NullDevice.conservativeLimits(), weak, false);
@@ -507,6 +670,12 @@ public final class PackSuite {
         eq(rm.optionCount(), 4, "4 options cover bool, select, slider and const");
         eq(rm.programCount(), 6, "6 programs, every stage listed explicitly");
         eq(rm.graph.presentResource, "taa", "the present resource is declared");
+        eq(rm.biomeSeamRadius, 2, "the reference pack asks for the widened seam (2 cells)");
+        eq(rm.graph.resources().size(), 8, "8 resources: the exact-id field joined the widened volume");
+        GraphSpec.ResourceSpec fieldIn = rm.graph.findResource("biome_field_ids");
+        check(fieldIn != null, "biome_field_ids is declared - the producer reads it, so the pass is a bake");
+        eq(fieldIn.format, GfxFormat.R32_UINT, "the field is exact ids, not bytes: one id per cell");
+        eq(rm.biomeSampleEntries, 4, "the widened seam keeps the four-entry contract");
 
         // The provider answers only with the pack's own declared programs and
         // sources, so the NULL device structurally validates the shipped GLSL
@@ -533,7 +702,13 @@ public final class PackSuite {
         rdev.beginFrame();
         RecordingCommandBuffer rcb = (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
         rcb.begin();
-        rc.execute(new GraphContext(rdev, rcb, rc, new FrameContext()));
+        // The widened seam's freshness gate now lives in the graph: the pass
+        // that writes biome_volume records its bake, and any pass that reads it
+        // refuses a stale volume by name before recording a command. Both halves
+        // are proven here, on the reference pack's own graph, through the pass
+        // bodies rather than by calling the tracker directly.
+        FrameContext rframe = new FrameContext();
+        rc.execute(new GraphContext(rdev, rcb, rc, rframe));
         rcb.end();
         rdev.submit(QueueType.GRAPHICS, rcb);
         rdev.endFrame();
@@ -543,6 +718,46 @@ public final class PackSuite {
         check(rcb.workGroupsDispatched() > 0, "the compute dispatches used the resolved extents");
         receipt("reference pack: loads 0 errors 0 warnings, frame " + rcb.commandCount() + " commands, "
                 + rc.totalBarriers() + " barriers, " + rcb.workGroupsDispatched() + " work groups, 0 violations");
+        // ...and the gate is not decorative: bake, then dirty the field, and the
+        // same graph refuses to run the reader.
+        {
+            final dev.auralite.render.biome.BiomeField gateField =
+                    new dev.auralite.render.biome.BiomeField();
+            gateField.allocate(23, 97, 23);
+            final dev.auralite.render.biome.BiomeRegistry gateReg =
+                    dev.auralite.render.biome.BiomeRegistry.vanillaDefaults();
+            final dev.auralite.render.biome.BiomeSeamVolume gateVol =
+                    new dev.auralite.render.biome.BiomeSeamVolume(gateField).radius(2);
+            gateVol.bake(gateReg);
+            final FrameContext staleFrame = new FrameContext();
+            staleFrame.bindBiomeVolume("biome_volume", gateVol);
+            // A bake through the graph's own pass body: run the producer once.
+            rdev.beginFrame();
+            RecordingCommandBuffer scb =
+                    (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
+            scb.begin();
+            rc.execute(new GraphContext(rdev, scb, rc, staleFrame));
+            scb.end();
+            rdev.submit(QueueType.GRAPHICS, scb);
+            rdev.endFrame();
+            eq(gateVol.freshness().bakeCount(), 1,
+                    "the host's bake is the record; a dispatch does not add one: " + gateVol.receipt());
+            // Fresh volume, field untouched: the graph runs.
+            check(gateVol.freshness().isFresh(), "the volume the frame just ran on is current");
+            gateField.setIdAtCell(3, 3, 3, 1);
+            check(!gateVol.freshness().isFresh(), "a field write after that frame makes it stale");
+            TestRig.throwsNamed(new Runnable() {
+                @Override public void run() {
+                    rdev.beginFrame();
+                    RecordingCommandBuffer bad =
+                            (RecordingCommandBuffer) rdev.createCommandBuffer(QueueType.GRAPHICS);
+                    bad.begin();
+                    rc.execute(new GraphContext(rdev, bad, rc, staleFrame));
+                }
+            }, "BIOME_VOLUME_STALE", "the graph refuses to run on a stale widened seam");
+            receipt("graph staleness gate: bake recorded by the pass, refusal raised by name on the next frame");
+        }
+
         rc.release();
         rdev.close();
 

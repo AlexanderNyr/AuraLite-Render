@@ -52,11 +52,51 @@ named. `optional` is advisory: the pack is expected to branch on it.
 ```
 spatialUniforms = true
 sampleEntries = 4
+seamRadius = 2
 ```
 
 `spatialUniforms` opts the pack into the baked 3D biome field (see the biome
 notes): legacy `if(in(biome,…))` expressions evaluate per cell at bake time
 instead of per fragment. Truthy: `true`, `1`, `yes`, `on`.
+
+`seamRadius` is the widened seam's blend radius **in cells** (default 2, i.e.
+five cells or 20 blocks of blend; `0` is today's one-cell seam). The ceiling
+is the pass's declared maximum, 4 — the kernel reads `(2R+1)^3` cells, so a
+larger radius would cost a bake it cannot pay for. A value outside `0..4`, or
+one that is not an integer, is **refused at load by name**
+(`BIOME_SEAM_R_TOO_WIDE`) and never clamped: a pack that asked for one seam
+and silently got another cannot tell the difference from a bug in its own
+shader. The reference pack declares `seamRadius = 2`.
+
+The widened volume is produced by a compute pass, not by the host: a pass
+writes `biome_volume` (`r32g32_uint`: four ids in `.x`, four weights in `.y`,
+low slot in the low byte) from `biome_field_ids` (`r32_uint`, the exact ids,
+`0xFFFFFFFF` for a cell nothing ingested).
+
+`r32g32_uint` and not `rgba8_uint` is the whole width of the trap, so it is
+stated here rather than left to the shader: a packed cell is four bytes inside
+ONE channel, and an 8-bit channel stores one. Narrowing an integer image write
+**saturates** instead of truncating — `0xFFFFFF06` and `0x12345678` both land as
+`255` — so three of the four slots become the UNKNOWN sentinel in every cell and
+a reader skips every contribution. The bake still runs, the frame still renders,
+and only the pixels are wrong; a pack author hitting this sees a black screen
+with no error anywhere. Two 32-bit channels hold the same 16 bytes per cell the
+8-bit form was meant to hold, and `rg32ui`/`rg32_uint` is spelled the same way
+in both backends. `packs/AuraLite-Native` ships that
+pass as `shaders/biome_field.comp`, which is **generated** — `make shader`
+rewrites it from `BiomeSeamShader`, and `make shader-check` fails by name
+when the committed file and the generator disagree, so the shader cannot
+drift away from the CPU rule it mirrors.
+
+Two refusals belong to this lane and are named before any code:
+
+- `BIOME_VOLUME_IDS_OVER_TOPK` — an id a byte cannot carry (above 254) is
+  never truncated into a different biome. The host bake throws by name; the
+  shader marks the cell `255` with zero weights, because a compute invocation
+  cannot throw and an invented id is worse than an honest hole.
+- `BIOME_VOLUME_STALE` — a field region was touched but the pass has not run
+  before a frame reads the volume. Reserved here, not yet enforced: a stale
+  seam still looks plausible, which is exactly why the name exists in advance.
 
 ### [resources]
 
@@ -121,7 +161,16 @@ case is load-bearing, not incidental.
 Clauses: `color`/`colors`, `depth`, `read`/`reads`, `write`/`writes`,
 `program`, `when` (option name; a pass whose option is off is culled and
 names the option), `dispatch` (three comma-separated extent expressions for
-compute), bare `external` (touches the imported backbuffer). History resources
+compute), `dispatchBase` (`write` sizes those expressions from the first
+`write=` target instead of the framebuffer — required for a 3D bake, where a
+framebuffer-sized dispatch writes layer 0 and nothing else), bare `external`
+(touches the imported backbuffer).
+
+Compute dispatch expressions may use `width`, `height` and `depth`: the
+framebuffer's extents by default, or the target image's with
+`dispatchBase=write`. A pass that dispatches over the wrong extents is not an
+error the backend can report — the extra invocations simply do nothing — which
+is why the clause exists rather than a convention. History resources
 address sides explicitly: `taa.cur`, `taa.prev`.
 
 The graph builder orders passes by semantic RAW/WAW edges plus a declaration

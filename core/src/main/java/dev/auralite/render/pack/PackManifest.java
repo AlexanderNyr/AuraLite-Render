@@ -1,6 +1,7 @@
 package dev.auralite.render.pack;
 
 import dev.auralite.render.rhi.GfxCapability;
+import dev.auralite.render.rhi.ShaderSource;
 import dev.auralite.render.uniform.CustomUniformTable;
 
 import java.util.ArrayList;
@@ -53,6 +54,14 @@ public final class PackManifest {
     public boolean spatialBiomeUniforms;
     /** How many biomes the pack wants exposed per sample (1..4). */
     public int biomeSampleEntries = 4;
+    /**
+     * Blend radius in cells for the widened biome seam, from {@code [biome]
+     * seamRadius}. Default 2 (the plan's choice: five cells, 20 blocks); the
+     * ceiling is {@link dev.auralite.render.biome.BiomeSeam#MAX_RADIUS} and a
+     * pack past it is refused by name at load rather than clamped, because a
+     * pack that asked for one seam and got another cannot tell.
+     */
+    public int biomeSeamRadius = 2;
 
     // ---- options API ----------------------------------------------------
     public PackOption addOption(PackOption o) {
@@ -100,7 +109,34 @@ public final class PackManifest {
             String d = o.defineFor(e.getValue());
             if (!d.isEmpty()) out.add(d);
         }
+        // [biome] seamRadius is not an [options] entry but it is a define: the
+        // bake reads it as BIOME_SEAM_R, and a value that never reaches the
+        // shader is a knob that lies. Always emitted, so a pack's default is
+        // the one the shader compiles with.
+        out.add("#define BIOME_SEAM_R " + biomeSeamRadius);
         return out;
+    }
+
+    /**
+     * A stage with this pack's option defines pre-applied, so every provider
+     * compiles the shader the pack actually asked for.
+     *
+     * <p>This lives in core, and not in one provider's helper, because the two
+     * providers disagreed: the Vulkan one applied the defines and the GL one
+     * did not, so a pack option moved the Vulkan frame and left the GL frame
+     * bit-identical. That was measured, not deduced -- the seam probe at
+     * `seamRadius = 0` and at `= 2` produced the SAME backbuffer hash on the GL
+     * lane, which a widened seam cannot do. A define the loader knows about must
+     * not depend on which backend happens to build the pipeline.
+     */
+    public ShaderSource withOptionDefines(ShaderSource src) {
+        if (src == null || src.kind() != ShaderSource.Kind.GLSL) return src;
+        List<String> bare = new ArrayList<String>();
+        for (String line : activeDefines()) {
+            String d = line.startsWith("#define ") ? line.substring("#define ".length()) : line;
+            if (!d.trim().isEmpty()) bare.add(d);
+        }
+        return bare.isEmpty() ? src : src.withDefines(bare);
     }
 
     // ---- programs API ---------------------------------------------------

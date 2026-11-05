@@ -2,6 +2,8 @@ package dev.auralite.render.tests;
 
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -25,6 +27,9 @@ import dev.auralite.render.graph.CompiledGraph;
 import dev.auralite.render.graph.GraphContext;
 import dev.auralite.render.graph.RenderGraph;
 import dev.auralite.render.pack.PackGraphBuilder;
+import dev.auralite.render.biome.BiomeField;
+import dev.auralite.render.biome.BiomeRegistry;
+import dev.auralite.render.biome.BiomeSeamShader;
 import dev.auralite.render.pack.PackLoader;
 import dev.auralite.render.pack.PackManifest;
 import dev.auralite.render.pack.PackProgram;
@@ -115,9 +120,22 @@ public final class GpuSmoke {
      *  receipts in order on this process's streams. */
     static boolean runLaneInChild(String lane) {
         String java = System.getProperty("java.home") + "/bin/java";
-        ProcessBuilder pb = new ProcessBuilder(
-                java, "-cp", System.getProperty("java.class.path"),
-                GpuSmoke.class.getName(), "child-" + lane);
+        // -D properties do NOT cross a process boundary, and the lane's pack is
+        // selected by one (-Dauralite.pack). Dropping it silently ran the
+        // reference pack no matter what the caller asked for, which is exactly
+        // the sort of "it rendered, so it must be the right pack" trap the
+        // receipts exist to prevent: forward the pack choice explicitly.
+        java.util.List<String> cmd = new java.util.ArrayList<String>();
+        cmd.add(java);
+        cmd.add("-cp");
+        cmd.add(System.getProperty("java.class.path"));
+        String pack = System.getProperty("auralite.pack");
+        if (pack != null && !pack.isEmpty()) cmd.add("-Dauralite.pack=" + pack);
+        String glslang = System.getProperty("auralite.glslang");
+        if (glslang != null && !glslang.isEmpty()) cmd.add("-Dauralite.glslang=" + glslang);
+        cmd.add(GpuSmoke.class.getName());
+        cmd.add("child-" + lane);
+        ProcessBuilder pb = new ProcessBuilder(cmd);
         pb.inheritIO();
         try {
             int rc = pb.start().waitFor();
@@ -328,6 +346,14 @@ public final class GpuSmoke {
             dev.uploadImage(sceneImg, 0, px);
         }
 
+        // The widened seam's host side: a pack that declares a biome-volume
+        // input is a bake, and the host is what turns a field into texels. The
+        // reference pack declares no such resource (its terrain stage has no
+        // biome input yet), so this is inert there and a real upload for the
+        // seam probe - which is what makes that pack's pixel hash depend on the
+        // radius instead of on nothing.
+        boolean biomeDriven = uploadBiomeField(dev, manifest, compiled);
+
         dev.beginFrame();
         GfxCommandBuffer cmd = dev.createCommandBuffer(QueueType.GRAPHICS);
         cmd.begin();
@@ -342,13 +368,22 @@ public final class GpuSmoke {
         // The frame is not "rendered" until its pixels exist: hash mip 0 of
         // the backbuffer, and refuse to call the frame anything if the bytes
         // are all zero (rule: never claim a frame that isn't there).
+        // Diagnostics for a pack that paints what it baked: name what reached
+        // the volumes BEFORE the pixel check can fail, so the failure is
+        // attributable in one run.
+        String volumeReceipt = biomeDriven
+                ? describeVolume(dev, compiled, "biome_field_ids")
+                  + "; " + describeVolume(dev, compiled, "biome_volume")
+                : "";
         byte[] pixels = dev.readImage(backbuffer);
         int nonzero = 0;
         for (byte b : pixels) if (b != 0) nonzero++;
         if (pixels.length == 0 || nonzero == 0) {
             throw new GfxException("gpu smoke: readback of the backbuffer is "
                     + (pixels.length == 0 ? "empty" : "all " + pixels.length + " bytes zero")
-                    + " - no frame reached the image");
+                    + " - no frame reached the image"
+                    + (volumeReceipt.isEmpty() ? "" : "; " + volumeReceipt)
+                    + "; pass order " + compiled.passOrder());
         }
         long[] ts = dev.frameTimestamps();
         if (ts.length < 2) {
@@ -370,6 +405,39 @@ public final class GpuSmoke {
         // the host's rebuild sequence here keeps that hazard under a gate: a
         // fresh compile, one executed frame, the old graph released, another
         // frame - on the real backend, with validation on.
+
+        // Step 8's gate: the SAME frame, twice, differing only in what the host
+        // put in the biome volume's source field. If the hash does not move, the
+        // terrain stage is not reading the volume - which is precisely the state
+        // this pack was in from step 2 until now: `read=biome_volume` declared,
+        // not one texel touched, every receipt green. A gate that cannot fail is
+        // worse than no gate, so this one is built to be able to.
+        String volumeDriven = "";
+        if (biomeDriven) {
+            fillBiomeField(dev, compiled, true);
+            dev.beginFrame();
+            GfxCommandBuffer bcmd = dev.createCommandBuffer(QueueType.GRAPHICS);
+            bcmd.begin();
+            compiled.execute(new GraphContext(dev, bcmd, compiled, new FrameContext()));
+            bcmd.end();
+            dev.submit(QueueType.GRAPHICS, bcmd);
+            dev.waitIdle();
+            dev.endFrame();
+            byte[] second = dev.readImage(backbuffer);
+            String firstHash = sha256Hex(pixels);
+            String secondHash = sha256Hex(second);
+            if (firstHash.equals(secondHash)) {
+                throw new GfxException("gpu smoke: the frame did not change when the biome volume's"
+                        + " source field changed - the terrain pass declares read=biome_volume and"
+                        + " does not sample it (hash " + firstHash + ")");
+            }
+            volumeDriven = "; volume-driven: " + firstHash.substring(0, 16) + " != "
+                    + secondHash.substring(0, 16) + " after a uniform field";
+            // Put the split field back: the rebuild-replay gate below must run on
+            // the same input the first frame saw.
+            fillBiomeField(dev, compiled, false);
+        }
+
         for (int round = 0; round < 2; round++) {
             CompiledGraph next = graph.compile(WIDTH, HEIGHT, dev.limits());
             next.allocate(dev);
@@ -409,14 +477,26 @@ public final class GpuSmoke {
             if (sceneAgain != null) sceneAgain.close();
             compiled = next;
         }
-        String receipt = cmd.commandCount() + " commands, " + compiled.totalBarriers()
+        String receipt = (biomeDriven ? "biome field uploaded, " : "")
+                + cmd.commandCount() + " commands, " + compiled.totalBarriers()
                 + " barriers, " + compiled.passOrder().size() + " passes, 0 violations (none raised), "
                 + WIDTH + "x" + HEIGHT + " on \"" + dev.deviceName() + "\""
+                + (volumeReceipt.isEmpty() ? "" : "; " + volumeReceipt)
+                + volumeDriven
                 + "; pixels sha256=" + sha256Hex(pixels)
+                + (biomeDriven ? "; centre=" + centrePixel(pixels) : "")
                 + " nonzero=" + nonzero + "/" + pixels.length
                 + "; timestamps " + ts[0] + " < " + ts[ts.length - 1];
         compiled.release();
         return receipt;
+    }
+
+    /** RGBA at the middle of the frame, as hex: a frame that ignores its input shows a constant. */
+    static String centrePixel(byte[] px) {
+        if (px == null || px.length < WIDTH * HEIGHT * 4) return "n/a";
+        int i = ((HEIGHT / 2) * WIDTH + WIDTH / 2) * 4;
+        return String.format("%02x%02x%02x%02x", px[i] & 0xFF, px[i + 1] & 0xFF,
+                px[i + 2] & 0xFF, px[i + 3] & 0xFF);
     }
 
     static String sha256Hex(byte[] data) {
@@ -441,8 +521,15 @@ public final class GpuSmoke {
             @Override public GfxPipeline rasterPipeline(String name, GfxDesc.RenderPass pass) {
                 PackProgram p = requireProgram(manifest, name);
                 GfxDesc.GraphicsPipeline gp = new GfxDesc.GraphicsPipeline().renderPass(pass).layout(p.layout()).named(name);
-                ShaderSource vs = p.stage(GfxStage.VERTEX);
-                ShaderSource fs = p.stage(GfxStage.FRAGMENT);
+                // The pack's option defines are applied here through the SAME
+                // core call the fabric providers use (PackManifest
+                // .withOptionDefines). The harness used to feed raw stages to
+                // the device, so a lane could compile a shader the pack never
+                // asked for: the GL lane rendered seamRadius = 2 for BOTH probe
+                // packs while the Vulkan lane - which applied the defines -
+                // rendered two different frames.
+                ShaderSource vs = manifest.withOptionDefines(p.stage(GfxStage.VERTEX));
+                ShaderSource fs = manifest.withOptionDefines(p.stage(GfxStage.FRAGMENT));
                 if (vs != null) {
                     gp.stage(dev.createShaderModule(vs));
                 }
@@ -458,7 +545,8 @@ public final class GpuSmoke {
                     return null;
                 }
                 return dev.createComputePipeline(GfxDesc.ComputePipeline
-                        .of(dev.createShaderModule(p.stage(GfxStage.COMPUTE)))
+                        .of(dev.createShaderModule(
+                                manifest.withOptionDefines(p.stage(GfxStage.COMPUTE))))
                         .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
                         .layout(p.layout()).named(name));
             }
@@ -475,13 +563,15 @@ public final class GpuSmoke {
             throws Exception {
         final Path dir = Files.createTempDirectory("auralite-spv");
         final Map<String, ShaderSource> cache = new HashMap<>();
+        final java.util.List<String> defines =
+                java.util.Collections.unmodifiableList(manifest.activeDefines());
         final PipelineProvider glsl = glslProvider(dev, manifest);
         return new PipelineProvider() {
             @Override public GfxPipeline rasterPipeline(String name, GfxDesc.RenderPass pass) {
                 PackProgram p = requireProgram(manifest, name);
                 GfxDesc.GraphicsPipeline gp = new GfxDesc.GraphicsPipeline().renderPass(pass).layout(p.layout()).named(name);
-                ShaderSource vs = toSpirv(dir, cache, p.stage(GfxStage.VERTEX));
-                ShaderSource fs = toSpirv(dir, cache, p.stage(GfxStage.FRAGMENT));
+                ShaderSource vs = toSpirv(dir, cache, p.stage(GfxStage.VERTEX), defines);
+                ShaderSource fs = toSpirv(dir, cache, p.stage(GfxStage.FRAGMENT), defines);
                 if (vs != null) {
                     gp.stage(dev.createShaderModule(vs));
                 }
@@ -496,7 +586,7 @@ public final class GpuSmoke {
                 if (p == null || p.stage(GfxStage.COMPUTE) == null) {
                     return null;
                 }
-                ShaderSource comp = toSpirv(dir, cache, p.stage(GfxStage.COMPUTE));
+                ShaderSource comp = toSpirv(dir, cache, p.stage(GfxStage.COMPUTE), defines);
                 return dev.createComputePipeline(GfxDesc.ComputePipeline
                         .of(dev.createShaderModule(comp))
                         .localSize(p.localSizeX, p.localSizeY, p.localSizeZ)
@@ -518,14 +608,15 @@ public final class GpuSmoke {
         return p;
     }
 
-    private static ShaderSource toSpirv(Path dir, Map<String, ShaderSource> cache, ShaderSource src) {
+    private static ShaderSource toSpirv(Path dir, Map<String, ShaderSource> cache, ShaderSource src,
+                                        java.util.List<String> defines) {
         if (src == null) {
             return null;
         }
         if (src.kind() != ShaderSource.Kind.GLSL) {
             return src;
         }
-        String key = src.origin() + "|" + src.stage();
+        String key = src.origin() + "|" + src.stage() + "|" + defines;
         ShaderSource hit = cache.get(key);
         if (hit != null) {
             return hit;
@@ -544,7 +635,29 @@ public final class GpuSmoke {
         try {
             String safe = src.origin().replace('/', '_').replace('\\', '_');
             Path in = dir.resolve(safe + "." + stageArg);
-            Files.write(in, src.text().getBytes(StandardCharsets.UTF_8));
+            // PACK OPTIONS ARE DEFINES. They were being collected and never
+            // compiled with, so every option was inert in every shader -- found
+            // by a probe that changed a radius and got a byte-identical frame.
+            // The stage may already carry the pack's defines (it arrives through
+            // manifest.withOptionDefines), and `defines` is the same list. A
+            // second copy is harmless only while the define is guarded by
+            // #ifndef - a bare one would be a redefinition warning, so the
+            // already-carried copy wins and the explicit list fills in the rest.
+            java.util.List<String> bare = new java.util.ArrayList<String>();
+            for (String d : defines) {
+                String name = d.replaceFirst("^#define\\s+", "").split("\\s+")[0];
+                boolean carried = false;
+                for (String have : src.defines()) {
+                    if (have.equals(d.replaceFirst("^#define\\s+", ""))
+                            || have.startsWith(name + " ")) {
+                        carried = true;
+                        break;
+                    }
+                }
+                if (!carried) bare.add(d);
+            }
+            String text = dev.auralite.render.pack.PackDefines.apply(src.text(), bare);
+            Files.write(in, text.getBytes(StandardCharsets.UTF_8));
             Path out = dir.resolve(safe + "." + stageArg + ".spv");
             ProcessBuilder pb = new ProcessBuilder(
                     "glslangValidator", "-V", "-S", stageArg, "-o", out.toString(), in.toString());
@@ -603,5 +716,127 @@ public final class GpuSmoke {
             sb.append(lines[i].trim());
         }
         return sb.toString();
+    }
+
+    // ---- widened biome seam: the probe's host side ----------------------------
+
+
+
+    /** Cell counts the reference lane uses; also what the graph is built with. */
+    static final int[] CELLS = { 23, 97, 23 };
+
+    /**
+     * Uploads {@code biome_field_ids} when the pack declares it.
+     *
+     * @return true when a field was uploaded, false when the pack wants none
+     *         (the reference pack today), so a receipt can say which happened
+     *         instead of leaving the reader to guess
+     */
+    static boolean uploadBiomeField(GfxDevice dev, PackManifest manifest, CompiledGraph compiled) {
+        if (manifest.graph.findResource("biome_field_ids") == null) return false;
+        fillBiomeField(dev, compiled, Boolean.getBoolean("auralite.smoke.uniformBiome"));
+        return true;
+    }
+
+    /**
+     * Uploads the host's exact-id field into the graph's source volume.
+     *
+     * <p>{@code uniform} selects the CONTENT: a swamp/plains split down the
+     * middle, or one biome everywhere. The two are the step-8 gate's inputs - the
+     * same frame must draw differently for them, or the terrain stage is not
+     * reading what the bake wrote.
+     */
+    static void fillBiomeField(GfxDevice dev, CompiledGraph compiled, boolean uniform) {
+        GfxImage target = imageOf(compiled, "biome_field_ids");
+        int sx = CELLS[0], sy = CELLS[1], sz = CELLS[2];
+
+        BiomeRegistry reg = BiomeRegistry.vanillaDefaults();
+        BiomeField field = new BiomeField();
+        field.allocate(sx, sy, sz);
+        int swamp = reg.constantId("BIOME_SWAMP");
+        int plains = reg.constantId("BIOME_PLAINS");
+        int border = uniform ? 0 : sx / 2;
+        for (int z = 0; z < sz; z++) {
+            for (int y = 0; y < sy; y++) {
+                for (int x = 0; x < sx; x++) {
+                    field.setIdAtCell(field.originCX() + x, field.originCY() + y,
+                            field.originCZ() + z, x < border ? swamp : plains);
+                }
+            }
+        }
+
+        // The host sends the EXACT ids; 0xFFFFFFFF is the pack format's "nothing
+        // ingested", the same value BiomeFieldPacker writes.
+        ByteBuffer px = ByteBuffer.allocateDirect(sx * sy * sz * 4).order(ByteOrder.nativeOrder());
+        int[] ids = field.rawIds();
+        for (int i = 0; i < ids.length; i++) {
+            px.putInt(ids[i] == BiomeField.UNKNOWN ? (int) BiomeSeamShader.UNKNOWN_FIELD : ids[i]);
+        }
+        px.flip();
+        // Synchronous by contract: the backend's one-shot path waits on its own
+        // fence before returning. A `dev.waitIdle()` used to sit here as a
+        // diagnostic for a suspected race, and it changed nothing - which is
+        // one of the measurements that finally pointed at the format instead
+        // of the ordering. Removed so the next reader is not invited to chase
+        // a race that does not exist.
+        dev.uploadImage(target, 0, px);
+        if (target.format() != GfxFormat.R32_UINT) {
+            throw new GfxException("biome_field_ids must be r32_uint, the graph allocated "
+                    + target.format());
+        }
+    }
+
+    /**
+     * What actually reached the volume, read back from the device. A probe pack
+     * that renders black has three candidate causes -- no dispatch, a dispatch
+     * that missed the image, or a shader that wrote nothing -- and this
+     * distinguishes them instead of leaving the next revision to guess.
+     */
+    static String describeVolume(GfxDevice dev, CompiledGraph compiled, String name) {
+        if (manifestHas(compiled, name)) {
+            try {
+                byte[] raw = dev.readImage(imageOf(compiled, name));
+                int nonzero = 0;
+                java.util.Set<Integer> distinct = new java.util.TreeSet<Integer>();
+                for (byte b : raw) { if (b != 0) nonzero++; distinct.add(b & 0xFF); }
+                StringBuilder head = new StringBuilder();
+                for (int i = 0; i + 3 < raw.length && i < 24; i += 4) {   // six words
+                    head.append(String.format("%02x%02x%02x%02x ",
+                            raw[i] & 0xFF, raw[i + 1] & 0xFF, raw[i + 2] & 0xFF, raw[i + 3] & 0xFF));
+                }
+                // A byte histogram, because the failure this receipt exists for
+                // is invisible in a prefix: the volume was right in size,
+                // nonzero and plausible while EVERY cell held the same word
+                // (slots 1..3 saturated to 255 by an 8-bit channel). Two
+                // distinct byte values across 200 kB says "one value repeated"
+                // at a glance; ten texels of prefix did not.
+                java.util.Map<Integer, Integer> hist = new java.util.TreeMap<Integer, Integer>();
+                for (byte b : raw) hist.merge(b & 0xFF, 1, Integer::sum);
+                StringBuilder hb = new StringBuilder();
+                for (java.util.Map.Entry<Integer, Integer> e : hist.entrySet()) {
+                    if (hb.length() > 0) hb.append(' ');
+                    hb.append(String.format("%02x:%d", e.getKey(), e.getValue()));
+                }
+                head.append("| hist ").append(hb);
+                return name + ": " + raw.length + " B, " + nonzero + " nonzero, "
+                        + distinct.size() + " distinct byte values, first " + head;
+            } catch (RuntimeException e) {
+                return name + ": unreadable (" + e.getMessage() + ")";
+            }
+        }
+        return name + ": not declared";
+    }
+
+    private static boolean manifestHas(CompiledGraph compiled, String name) {
+        try {
+            return imageOf(compiled, name) != null;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** The graph's own image for a resource name, whatever its extent. */
+    static GfxImage imageOf(CompiledGraph compiled, String name) {
+        return compiled.graph().require(name).image();
     }
 }
