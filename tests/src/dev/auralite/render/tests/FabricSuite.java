@@ -107,9 +107,9 @@ public final class FabricSuite {
         try {
             contains(read(root.resolve("build.gradle")), "JavaLanguageVersion.of(21)",
                     "the gradle lane pins a java 21 toolchain");
-            contains(read(root.resolve("build.gradle")), "zipTree(\"../third_party/",
+            contains(read(root.resolve("build.gradle")), "zipTree('../third_party/",
                     "the gradle lane reads compile-only LWJGL from the host's ../third_party jars");
-            contains(read(root.resolve("build.gradle")), "strippedLwjgl",
+            contains(read(root.resolve("build.gradle")), "lwjglJars",
                     "and wires compileOnly to multi-release-stripped copies "
                             + "(tiny-remapper rejects the jar's class major 71 entries)");
         } catch (Exception e) {
@@ -158,7 +158,106 @@ public final class FabricSuite {
             check(false, "the frame bridge could not be read: " + e);
         }
 
+        section("rebuild receipts: the r42 teardown is in the shipped lane");
+        try {
+            Path vk = Paths.get(
+                    "backend-vulkan/src/main/java/dev/auralite/render/backend/vk/VkDevice.java");
+            check(Files.isRegularFile(vk), "the Vulkan backend source is readable for the gate");
+            String v = read(vk);
+            contains(v, "ResourceCacheOwnership",
+                    "the backend tracks which cached entries a resource owns");
+            contains(v, "purgeCachesForImage",
+                    "and an image teardown exists - the r62 tree had the docs and not the code");
+            int close = v.indexOf("device.liveImages.remove(this);");
+            int purge = v.indexOf("device.purgeCachesForImage(handle);");
+            int destroy = v.indexOf("vkDestroyImage(device.device, handle, null);");
+            check(close >= 0 && purge > close && destroy > purge,
+                    "the purge runs inside VkImage.close(), before the image is destroyed");
+            contains(v, "public String cacheReceipt()",
+                    "the teardown reports itself (imagesLive/released/viewsTorn/fbosTorn)");
+            check(!v.contains("createMessenger(MemoryStack"),
+                    "and there is no debug-messenger path that only exists to crash on enable");
+
+            Path loop = root.resolve(
+                    "src/main/java/dev/auralite/render/fabric/RendererLoop.java");
+            String l = read(loop);
+            contains(l, "cacheReceipt()",
+                    "the host rebuild line asks the Vulkan device for that receipt");
+            contains(l, "present/frame:",
+                    "and present hashes the whole pack output, not one centre pixel once");
+            contains(l, "packedBytes(",
+                    "the bake receipt quotes the packer's byte count instead of cells x 4");
+
+            // The teardown ORDER, from the r62 trace: the process died on the
+            // frame after a reload, which is what freeing images in front of
+            // an in-flight submit looks like. Pinned as text because the host
+            // has no driver to fault, and a reordering that drops the drain is
+            // invisible to every other gate.
+            int invalidate = l.indexOf("pipelines.invalidate()");
+            int release = l.indexOf("graph.release()");
+            int drainStart = l.indexOf("drainT0 = System.nanoTime");
+            check(invalidate >= 0 && release > invalidate,
+                    "rebuild order is drain -> pipelines die -> pack load -> old graph released");
+            check(drainStart > 0 && drainStart < release,
+                    "and a second waitIdle sits between the new graph's uploads and the release");
+            contains(l, "drained before release",
+                    "the drain is timed into the trace, so its cost is a receipt, not a hope");
+
+            // r64: the things the live log proved r63 had NOT done.
+            contains(l, "pendingRelease",
+                    "the old graph is parked, not freed, inside the rebuild call");
+            contains(l, "RELEASE_GRACE_FRAMES",
+                    "and it survives a named number of frames before release()");
+            int defer = l.indexOf("pendingRelease = graph;");
+            int grace = l.indexOf("frames - pendingReleaseAtFrame");
+            int burst = l.indexOf("releasing the graph deferred by");
+            check(defer > 0 && grace > 0 && burst > 0,
+                    "park happens in rebuild, the free on a later frame's path and in a burst "
+                            + "(saw park " + defer + ", grace " + grace + ", burst " + burst + ")");
+            int begin = l.indexOf("device.beginFrame()");
+            check(grace > 0 && grace < begin,
+                    "the free is BEFORE this frame's beginFrame, so no new work is queued "
+                            + "against a graph that is being freed");
+            contains(l, "release timing:",
+                    "and the deferral is receipted (count + longest hold), not just done");
+            int drain = l.indexOf("drained before release");
+            check(drain > 0 && drain < defer,
+                    "the r63 drain stays - it retires the load's own submits - but is no "
+                            + "longer the only wait in front of a release");
+            contains(l, "biomeReceiptLogged = false;",
+                    "the bake receipt re-arms when the answer changes instead of once per session");
+            contains(l, "unattributed",
+                    "a refusal nobody counted gets its own number instead of vanishing");
+            contains(v, "dying.contains(e.getValue())",
+                    "the view sweep matches the purge answer by VALUE while removing by KEY: "
+                            + "purge hands back handles and the cache is keyed by view key, and "
+                            + "treating one as the other is the r63 bug that left viewsTorn=0");
+            contains(v, "viewsUnattributed++",
+                    "and an image whose ownership named nothing is COUNTED, not silently skipped");
+            contains(read(Paths.get(
+                            "core/src/main/java/dev/auralite/render/util/ResourceCacheOwnership.java")),
+                    "public boolean owns(Object key)",
+                    "the keyed question the utility answers stays on the books for the next sweep");
+            int frees = 0, at = 0;
+            while ((at = l.indexOf("pendingRelease.release()", at + 1)) > 0) frees++;
+            check(frees == 2,
+                    "released from exactly two places - the grace path and a rebuild burst - "
+                            + "each behind its own null test (a third is a double free), saw " + frees);
+            check(l.indexOf("pendingRelease.release()", l.indexOf("if (pendingRelease != null &&")) > 0,
+                    "the grace release sits behind its null guard");
+            check(l.indexOf("pendingRelease.release()", l.indexOf("if (pendingRelease != null) {")) > 0,
+                    "and so does the burst one");
+
+            Path plan = Paths.get("docs/plans/BIOME_PLAN.md");
+            String planText = read(plan);
+            check(!planText.contains("<<<<<<<") && !planText.contains(">>>>>>>"),
+                    "BIOME_PLAN carries no unresolved merge markers - the r62 tree did");
+        } catch (Exception e) {
+            check(false, "the rebuild receipts could not be read: " + e);
+        }
+
         receipt("fabric: sources + json gated (7 sources, entrypoint, mixins, java 21); "
+                + "rebuild receipts pinned (VkDevice purge, drain before release, present hash); "
                 + "windowed-frame gate NOT claimed here - needs JDK 21 + GPU (Phase 4)");
     }
 }

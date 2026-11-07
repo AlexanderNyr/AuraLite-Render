@@ -106,6 +106,57 @@ public final class RhiSuite {
             @Override public void run() { spirv.withDefines(Arrays.asList("X 1")); }
         }, "SPIR-V cannot take preprocessor defines", "defines on SPIR-V are refused with a reason");
 
+        // The rule behind the r62 crash, gated where a GPU cannot be needed:
+        // a cached object that names a dead resource must go with it. This is
+        // the ownership bookkeeping the Vulkan backend uses for attachment
+        // views and framebuffers, so the driver fault it prevents (a
+        // use-after-free the GT 710 answers with 0xC0000409 shortly after a
+        // rebuild) has a host-side guard instead of only a screenshot.
+        section("cache ownership: a dead resource drops its entries");
+        dev.auralite.render.util.ResourceCacheOwnership<String, String> owned =
+                new dev.auralite.render.util.ResourceCacheOwnership<String, String>();
+        owned.attach("view:9:0", "V9a", java.util.Collections.singletonList("img9"));
+        eq(owned.entryCount(), 1, "an attached entry is counted");
+        eq(owned.purge("img9").toString(), "[V9a]",
+                "releasing the image returns exactly the view it owned, for destruction");
+        eq(owned.entryCount(), 0, "and the entry is gone from the bookkeeping");
+        eq(owned.purge("img9").size(), 0, "purging a dead resource twice is empty, not fatal");
+        // The sweep the Vulkan backend actually runs walks its cache BY KEY and
+        // asks this question, because `purge` answers with VALUES (the handles to
+        // destroy). r63 removed a handle from a map keyed by key: the removal
+        // returned null, the guard skipped the destroy, and `viewsTorn=0` sat
+        // next to a cache that grew every rebuild - so `owns` is gated here,
+        // including for a key that was never attached.
+        owned.attach("view:7", "V7", java.util.Collections.singletonList("img7"));
+        check(owned.owns("view:7"), "an attached key answers as owned");
+        check(!owned.owns("V7"), "the VALUE it holds is not a key: asking with a handle says no");
+        owned.purge("img7");
+        check(!owned.owns("view:7"), "and after the purge the key is nobody's");
+        check(!owned.owns(null), "a null key is refused rather than thrown at");
+
+        owned.attach("fb:1", "F1", java.util.Arrays.asList("imgA", "imgB"));
+        owned.attach("fb:2", "F2", java.util.Collections.singletonList("imgB"));
+        java.util.List<String> dropped = owned.purge("imgB");
+        eq(dropped.size(), 2,
+                "one freed attachment invalidates EVERY framebuffer built from it (shared-key rule)");
+        eq(owned.entriesFor("imgA"), 0,
+                "and the co-owner's entry goes too: a framebuffer with a freed attachment is not valid");
+
+        try {
+            owned.attach("fb:x", "V", java.util.Collections.<String>emptyList());
+            check(false, "an entry with no owning resource must be refused");
+        } catch (IllegalArgumentException expected) {
+            check(true, "an entry that can never be invalidated is refused by constructor");
+        }
+        try {
+            owned.attach(null, "V", java.util.Collections.singletonList("imgZ"));
+            check(false, "an entry with no key must be refused");
+        } catch (IllegalArgumentException expected) {
+            check(true, "and so is one that cannot be found again to be dropped");
+        }
+        receipt("cache ownership: " + owned.entryCount()
+                + " entries left after two purges; a shared key drops for every owner");
+
         section("capabilities");
         eq(GfxCapability.values().length, 27, "the capability enum has 27 members");
         check(GfxCapability.COMPUTE_SHADERS.ordinal() == 0, "COMPUTE_SHADERS is first");

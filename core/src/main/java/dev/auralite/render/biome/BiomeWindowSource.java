@@ -81,6 +81,8 @@ public final class BiomeWindowSource {
     private long cellsWritten;
     private long lastUnmapped;
     private long lastUnloaded;
+    private long lastColumnsRefused;
+    private long retriesAfterEmptyWindow;
     private int lastChanged;
     private String lastOutcome = "never rebuilt";
 
@@ -112,6 +114,10 @@ public final class BiomeWindowSource {
     public long lastUnmapped() { return lastUnmapped; }
     public long lastUnloaded() { return lastUnloaded; }
     public int lastChanged() { return lastChanged; }
+    /** Chunk columns the world refused to answer on the last rebuild. */
+    public long lastColumnsRefused() { return lastColumnsRefused; }
+    /** Rebuilds skipped because nothing was answered - the retry counter. */
+    public long retriesAfterEmptyWindow() { return retriesAfterEmptyWindow; }
     public String lastOutcome() { return lastOutcome; }
 
     /**
@@ -172,6 +178,7 @@ public final class BiomeWindowSource {
         int changed = 0;
         int unmapped = 0;
         int unloaded = 0;
+        int refused = 0;
         int half = cellSize / 2;
         int columns = 0;
         // A real world answers by COLUMN, and one column usually covers the
@@ -191,6 +198,7 @@ public final class BiomeWindowSource {
                     // The world does not have this chunk. Its cells are holes
                     // with their own reason - never the last column's biome,
                     // and never a per-block trip that would generate it.
+                    refused++;
                     for (int cy = 0; cy < cellsY; cy++) {
                         if (field.setIdAtCell(ox + cx, oy + cy, oz + cz, BiomeField.UNKNOWN)) {
                             changed++;
@@ -211,21 +219,59 @@ public final class BiomeWindowSource {
                 }
             }
         }
+        if (byColumn && columns == 0) {
+            // No "did we have data before" test: the r63 version of this line
+            // required builds > 0 || filledCells > 0, which is FALSE at spawn,
+            // so the first-ever unanswered pass fell through, incremented
+            // `builds`, printed "window NOT stamped, retry due" - and armed the
+            // throttle for a retry that could never be needed, because the
+            // stamp was set anyway by the fall-through path below.
+
+            // NOTHING was answered. Overwriting the window with holes and
+            // stamping it as built is how the r62 session ended up with a
+            // permanently empty field: the first bake ran at spawn, before the
+            // client's chunk pool held a single column at the new position,
+            // every one of those 529 lookups was refused, and the next rebuild
+            // was refused by the *window* rule - the player had not crossed a
+            // cell - so the seam stayed empty for the rest of the session.
+            // The throttle below is what paces this retry instead.
+            lastBuildFrame = frameIndex;
+            lastChanged = 0;
+            lastUnmapped = 0;
+            lastUnloaded = 0;
+            lastColumnsRefused = refused;
+            retriesAfterEmptyWindow++;
+            lastOutcome = "no chunk column answered (" + refused
+                    + " refused); previous window kept, retrying on the throttle";
+            return 0;
+        }
         if (byColumn) {
             // Every column was answered: no per-block call is needed, and the
             // receipt says so with a count the caller can check.
-            builtCellX = field.worldToCellX(wx);
-            builtCellY = field.worldToCellY(wy);
-            builtCellZ = field.worldToCellZ(wz);
+            //
+            // The cell stamp is what suppresses the next rebuild, so it is only
+            // earned by a window that got data. A pass where the world refused
+            // every column leaves it un-stamped and the retry is due the moment
+            // the throttle allows it - the fix for the r62 session, where the
+            // first bake at spawn saw no chunks at all and the field then sat
+            // empty for four minutes because the stamp said "covered".
+            if (columns > 0) {
+                builtCellX = field.worldToCellX(wx);
+                builtCellY = field.worldToCellY(wy);
+                builtCellZ = field.worldToCellZ(wz);
+            }
             lastBuildFrame = frameIndex;
             builds++;
             cellsWritten += (long) cellsX * cellsY * cellsZ;
             lastChanged = changed;
             lastUnmapped = unmapped;
             lastUnloaded = unloaded;
+            lastColumnsRefused = refused;
             lastOutcome = "rebuilt from " + columns + " of " + (cellsX * cellsZ)
                     + " chunk columns: " + changed + " changed, " + unmapped
-                    + " unmapped, " + unloaded + " unloaded";
+                    + " unmapped, " + unloaded + " unloaded, " + refused
+                    + " column(s) refused"
+                    + (columns == 0 ? "; window NOT stamped, retry due" : "");
             return changed;
         }
         for (int cz = 0; cz < cellsZ; cz++) {
@@ -288,6 +334,7 @@ public final class BiomeWindowSource {
                 + field.originCX() + "," + field.originCY() + "," + field.originCZ() + ")"
                 + ", " + field.filledCells() + " filled / " + field.unknownCount() + " unknown"
                 + ", " + builds + " rebuild(s), " + field.windowMoves() + " window move(s)"
+                + ", " + retriesAfterEmptyWindow + " empty-window retry(ies)"
                 + ", last: " + lastOutcome;
     }
 }

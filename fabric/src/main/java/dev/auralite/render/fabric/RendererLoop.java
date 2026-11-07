@@ -56,11 +56,35 @@ public final class RendererLoop {
     /** The live world's biomes, and the widened seam baked from them each rebuild. */
     private static WorldBiomeSource biomes;
     private static BiomeSeamVolume seamVolume;
+    /** What the GPU actually holds: which bake was pushed, and when. */
+    private static final dev.auralite.render.biome.BiomeVolumeUpload biomeUpload =
+            new dev.auralite.render.biome.BiomeVolumeUpload();
+    /** The image the pack's widened seam is read from before the bake widens it. */
+    static final String BIOME_FIELD_RESOURCE = "biome_field_ids";
     private static long frameIndex;
     private static boolean biomeReceiptLogged;
+    private static long lastReceiptRebuilds = -1L;
+    private static long lastReceiptRefusals = -1L;
     private static PackManifest manifest;
     private static PipelineProvider pipelines;
     private static CompiledGraph graph;
+    /**
+     * The graph a rebuild replaced, kept alive until the driver is demonstrably
+     * done reading it. r63 put a `waitIdle` directly in front of `release()`
+     * and the r64 trace shows why that cannot work: the drain measured 73-114 us
+     * because the only thing still in flight was the PRESENT of the frame handed
+     * over a moment earlier - by the time the driver had read the old swapchain
+     * image, we had already freed it. The wait has to land in a LATER frame.
+     */
+    private static CompiledGraph pendingRelease;
+    private static long pendingReleaseAtFrame = -1L;
+    /** Frames an old graph must survive before it may be freed: one full
+     *  beginFrame retire plus one, so a slow present cannot still see it. */
+    private static final int RELEASE_GRACE_FRAMES = 2;
+    /** Receipt: how many releases were deferred, and the longest wait we made
+     *  the driver hold the dead graph for. */
+    private static long deferrals;
+    private static long maxPendingFrames;
     private static PackSource source;
     private static int presentFbo;               // game-context FBO for the blit
     private static boolean failed;
@@ -69,6 +93,10 @@ public final class RendererLoop {
     private static long lastFrameNanos = -1L;
     private static boolean stopped;             // set by shutdown(): never re-init after it
     private static boolean presentLogged;       // one present receipt per session
+    private static long presentReceipts;        // hashed present receipts since then
+    /** The layout the seam is uploaded into, remembered for the receipt line. */
+    private static dev.auralite.render.rhi.GfxFormat seamUploadFormat =
+            dev.auralite.render.rhi.GfxFormat.R32_UINT;
     // VK lane: the readImage below is deferred one frame - reading right
     // after submit made runOneShot wait for the whole pack (r35 stalls:
     // 10-15 fps with F8 on). The next frame's vanilla draw gives the GPU
@@ -171,6 +199,7 @@ public final class RendererLoop {
                     graphWidth, graphHeight));
             stage = "frame:present";
             present();
+            presentFrameEvidence();
             pacer.endFrame();
             frames++;
             if (framesSinceRebuild >= 0) framesSinceRebuild++;
@@ -190,6 +219,18 @@ public final class RendererLoop {
             lastError = e.toString();
             AuraLiteRenderMod.LOGGER.error("renderer loop failed; frames stop instead of "
                     + "spamming a broken device:", e);
+        } catch (LinkageError e) {
+            // A NoSuchMethodError/NoClassDefFoundError is not "the loop threw":
+            // it means the jar and the LWJGL the game ships disagree, and it
+            // killed a real client once (r61: memFree(ByteBuffer) compiled
+            // against 3.4.3, loaded against 3.3.3). Vanilla can keep drawing -
+            // the graphics stack is intact - so the honest answer is to stop
+            // the pack and say so on the status screen, not to end the game.
+            failed = true;
+            lastError = "LINKAGE: " + e;
+            AuraLiteRenderMod.LOGGER.error("renderer loop hit a LINKAGE error - the pack is "
+                    + "stopped and vanilla keeps drawing. This is a build/ABI mismatch between "
+                    + "this jar and the LWJGL the game ships, not a device fault:", e);
         }
     }
 
@@ -203,6 +244,17 @@ public final class RendererLoop {
         if (presentReadPending) {
             presentReadPending = false;
             swapchain.storePresentPixels(device.readImage(swapchain.image()));
+        }
+        // The grace expired: beginFrame has retired the fences of every submit
+        // the driver accepted up to and including the frame we presented last,
+        // so the images the previous graph owned are now unreadable by anything.
+        if (pendingRelease != null && frames - pendingReleaseAtFrame >= RELEASE_GRACE_FRAMES) {
+            long held = frames - pendingReleaseAtFrame;
+            if (held > maxPendingFrames) maxPendingFrames = held;
+            pendingRelease.release();
+            pendingRelease = null;
+            pendingReleaseAtFrame = -1L;
+            trace("deferred graph released after " + held + " frames");
         }
         long id = device.beginFrame();
         frame.beginFrame(id, now / 1.0e9f, deltaSeconds, now);
@@ -268,22 +320,122 @@ public final class RendererLoop {
             seamVolume = new BiomeSeamVolume(biomes.field());
         }
         if (changed == 0 && seamVolume.bakeNanos() > 0 && frame.biomeVolume("biome_volume") != null) {
+            // Nothing was rebuilt, so there is nothing new to push -- but the
+            // GPU copy still has to be the one this frame reads, and a rebuild
+            // between bakes (a resize, a device retry) leaves it unbound. Ask
+            // once per frame; the uploader answers "skip" for an unchanged bake.
+            uploadBiomeField(seamVolume);
             return;
+        }
+        // One receipt per session is not a receipt: it was read out of the
+        // FIRST bake, and that bake is the one frame where an empty world is
+        // normal. So a live log said "0 empty-window retry(ies)" and
+        // "0 filled / 51313 unknown" while the retry was in fact running, and
+        // the refusals it named were counted as zero because the counters are
+        // written by the reader DURING the pass that is printing them. Re-log on
+        // every pass that changed the answer - rebuilds are rare by design
+        // (a cell crossing, or one retry after an empty window), so this cannot
+        // become a per-frame print.
+        if (biomes.rebuilds() != lastReceiptRebuilds
+                || biomes.refusalReasons()[0] + biomes.refusalReasons()[1] != lastReceiptRefusals) {
+            biomeReceiptLogged = false;
         }
         seamVolume.radius(manifest != null ? manifest.biomeSeamRadius : 2);
         seamVolume.bake(biomes.registry());
         frame.bindBiomeVolume("biome_volume", seamVolume);
 
         // The volume the GPU holds is not the volume the CPU just baked until
-        // someone uploads it, and the host is that someone. The upload itself
-        // happens in the graph's allocate path today (the pack declares the
-        // resource); what is recorded here is the fact the gate must not
-        // guess: this bake is the one the frame is allowed to read.
+        // someone puts it there, and the host is that someone. This used to say
+        // the upload "happens in the graph's allocate path" -- it did not:
+        // allocate() creates images and writes none of them, so the compute
+        // pass read uninitialised device memory while every gate said fresh
+        // (r61). The push is explicit now, and a frame that cannot be pushed
+        // reports NOT_UPLOADED instead of pretending.
+        uploadBiomeField(seamVolume);
         if (!biomeReceiptLogged) {
             biomeReceiptLogged = true;
-            AuraLiteRenderMod.LOGGER.info("biome/bake: {} | {} | {} ids packed ({} B), {} weights",
-                    biomes.receipt(), volume.receipt(),
-                    volume.ids().length, volume.ids().length * 4L, volume.weights().length);
+            logBakeReceipt();
+        }
+    }
+
+    /**
+     * The bake's receipt line. Every number here is read from the object that
+     * produced it: cells from the volume, bytes from the packer for the layout
+     * actually in use, refusals from the reader. The r62 line multiplied cells
+     * by 4 and printed "ids packed (401 764 B)" beside an upload of 205 252 -
+     * a byte total no buffer held, in the one line a session is judged by.
+     */
+    private static void logBakeReceipt() {
+        long[] why = biomes.refusalReasons();
+        lastReceiptRebuilds = biomes.rebuilds();
+        lastReceiptRefusals = why[0] + why[1];
+        AuraLiteRenderMod.LOGGER.info(
+                "biome/bake: {} | {} | {} cells | pack {} | {} weights | {} | refused: {} no-manager, {} no-chunk, {} unattributed",
+                biomes.receipt(), seamVolume.receipt(), seamVolume.ids().length,
+                dev.auralite.render.biome.BiomeVolumeUpload.packedBytes(seamVolume,
+                        seamUploadFormat) + " B as " + seamUploadFormat,
+                seamVolume.weights().length, biomeUpload.state().receipt(),
+                why[0], why[1], why[2]);
+    }
+
+    /**
+     * One hashed receipt of what present actually put on the window, every 600
+     * frames while present is on. Rule 4's unit of proof is a measured frame,
+     * and "backbuffer center rgba=(5,5,5,255)" once per session is one pixel
+     * once: the hash covers the whole pack output, so a rebuild that changes
+     * the world changes the hash, and a claim of "the same frame twice" can be
+     * checked against a number instead of a screenshot.
+     */
+    private static void presentFrameEvidence() {
+        if (!presentEnabled) return;
+        byte[] pixels = swapchain.lastPresentPixels();
+        if (pixels == null) return;
+        if (presentLogged && frames % 600 != 0) return;
+        presentReceipts++;
+        String sha = sha256Prefix(pixels);
+        int w = swapchain.width(), h = swapchain.height();
+        int cx = (w / 2) * 4 + (h / 2) * w * 4;   // row 0 is the screen's bottom
+        AuraLiteRenderMod.LOGGER.info("present/frame: frames={} sha256={} bytes={}x{} center=({},{},{},{})",
+                frames, sha, w, h, pixels[cx] & 0xff, pixels[cx + 1] & 0xff,
+                pixels[cx + 2] & 0xff, pixels[cx + 3] & 0xff);
+    }
+
+    /** First 16 hex digits of the SHA-256 - enough to tell two frames apart. */
+    private static String sha256Prefix(byte[] bytes) {
+        try {
+            java.security.MessageDigest md = java.security.MessageDigest.getInstance("SHA-256");
+            byte[] d = md.digest(bytes);
+            StringBuilder sb = new StringBuilder(16);
+            for (int i = 0; i < 8; i++) sb.append(String.format("%02x", d[i]));
+            return sb.toString();
+        } catch (java.security.NoSuchAlgorithmException e) {
+            return "sha256-unavailable";
+        }
+    }
+
+    /**
+     * Pushes the baked field into the pack's {@code biome_field_ids} image.
+     *
+     * <p>Two things make this more than a memcpy. First, the image is created
+     * when the graph is allocated, so a bake that lands before the first frame
+     * or right after a rebuild finds no image and says so instead of claiming a
+     * push. Second, the pack declares that image at BIOME_VOLUME extent, and
+     * the host used to pass that extent as a literal {23, 97, 23} while baking
+     * its own constants -- two numbers that agreed by hand. They are one number
+     * now ({@link WorldBiomeSource#cellExtent()}), and a mismatch is refused by
+     * name rather than uploaded into a differently-shaped volume.
+     */
+    private static void uploadBiomeField(dev.auralite.render.biome.BiomeSeamVolume volume) {
+        if (graph == null) return;
+        dev.auralite.render.graph.GraphResource res = graph.graph().find(BIOME_FIELD_RESOURCE);
+        dev.auralite.render.rhi.GfxImage dst = res == null ? null : res.image();
+        try {
+            if (dst != null) seamUploadFormat = dst.desc().format;
+            biomeUpload.upload(volume, dst, dst == null ? null : device, false);
+        } catch (RuntimeException e) {
+            // A refused upload is a named failure, not a frame: the seam would
+            // be someone else's memory and no gate below may certify it.
+            AuraLiteRenderMod.LOGGER.error("biome/upload refused:", e);
         }
     }
 
@@ -541,9 +693,14 @@ public final class RendererLoop {
         trace("pack parsed");
         AuraLiteRenderMod.LOGGER.info("reload stage: pipelines");
         capture.resize(swapchain.width(), swapchain.height());
+        // The pack's widened-seam resources take their extent from the window
+        // the host actually bakes, not from a second copy of the numbers typed
+        // here: an image larger than the bake is a volume of uninitialised
+        // cells the terrain pass samples without complaint.
+        if (biomes == null) biomes = new WorldBiomeSource(BiomeRegistry.vanillaDefaults());
         RenderGraph rg = new PackGraphBuilder(manifest, pipelines)
                 .build(swapchain.width(), swapchain.height(), manifest.shadowMapResolution(),
-                        new int[] { 23, 97, 23 });
+                        biomes.cellExtent());
         CompiledGraph fresh = rg.compile(swapchain.width(), swapchain.height(), device.limits());
         stage = "reload:compiled";
         trace("pipelines built");
@@ -562,8 +719,36 @@ public final class RendererLoop {
         }
         stage = "reload:allocated";
         trace("graph compiled");
-        AuraLiteRenderMod.LOGGER.info("reload stage: graph ready, releasing the old one");
-        if (graph != null) graph.release();
+        // Drain again, immediately before the old graph is torn down. The drain
+        // at the top of rebuild() is too far away: the pack load between them
+        // submits its own one-shots (module staging, and the seam upload as of
+        // r61), and a release that frees images while any submit is still
+        // in-flight is the fault the trace put at "the frame after a reload".
+        // Timed, because the cost belongs in the receipt: the r62
+        // auralite-trace-4 shows ~3.0 s between a rebuild and the next traced
+        // frame, four rebuilds in a row, and death on the fifth - if the waits
+        // are already retired this line reads in microseconds.
+        long drainT0 = System.nanoTime();
+        device.waitIdle();
+        long drainNanos = System.nanoTime() - drainT0;
+        trace("drained before release (" + (drainNanos / 1000L) + " us)");
+        // A rebuild during a burst (F9 held down, a resize storm) must not
+        // stack graphs: if one is still parked from the previous rebuild, free
+        // it here, where the drain above has just retired everything.
+        if (pendingRelease != null) {
+            AuraLiteRenderMod.LOGGER.info("reload stage: releasing the graph deferred by "
+                    + (frames - pendingReleaseAtFrame) + " frames");
+            pendingRelease.release();
+            pendingRelease = null;
+            pendingReleaseAtFrame = -1L;
+        }
+        AuraLiteRenderMod.LOGGER.info("reload stage: graph ready, deferring the old one by {} frames",
+                RELEASE_GRACE_FRAMES);
+        if (graph != null) {
+            pendingRelease = graph;
+            pendingReleaseAtFrame = frames;
+            deferrals++;
+        }
         graph = fresh;
         AuraLiteRenderMod.LOGGER.info("reload stage: done");
         stage = "run";
@@ -572,12 +757,20 @@ public final class RendererLoop {
         // proves the graph itself does not leak, so what is left to watch is
         // the actual backend. These numbers must be identical rebuild to
         // rebuild; a climb is the leak, a constant is a dead end.
-        String vkDetail = "";
-        if (device instanceof dev.auralite.render.backend.vk.VkDevice vkd) {
-            vkDetail = " fbos=" + vkd.liveFramebufferCount()
-                    + " viewOwners=" + vkd.liveAttachmentViewOwners()
-                    + " invalidations=" + vkd.takeAttachmentInvalidationCount();
+        // The VK-only framebuffer/view counters this line once printed belong to
+        // the upstream backend; this one reports the RHI-wide live counts below,
+        // which both backends answer. A diagnostic that only compiles against a
+        // backend we do not ship is a diagnostic that never runs.
+        // The r42 receipt, restored: the cache teardown is Vulkan-only, so it
+        // is asked of the Vulkan device rather than dropped because the GL
+        // backend had nothing to answer. "released=9 viewsTorn=0" is the r61/r62
+        // regression printed as a fact; the numbers are the device's own.
+        if (deferrals > 0) {
+            AuraLiteRenderMod.LOGGER.info("release timing: {} deferral(s), longest {} frame(s)"
+                    + " (grace {})", deferrals, maxPendingFrames, RELEASE_GRACE_FRAMES);
         }
+        String vkDetail = device instanceof VkDevice
+                ? " | " + ((VkDevice) device).cacheReceipt() : "";
         AuraLiteRenderMod.LOGGER.info("device after rebuild: buffers={} images={} pipelines={} modules={}{}",
                 device.liveBufferCount(), device.liveImageCount(),
                 device.livePipelineCount(), device.liveShaderModuleCount(), vkDetail);

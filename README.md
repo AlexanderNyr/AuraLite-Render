@@ -42,7 +42,7 @@ Host rule: everything except `fabric/` stays Java 11 source-compatible, so
 `make test` is genuinely green on OpenJDK 11. `fabric/` is the documented
 exception — it needs a JDK 21 lane this sandbox does not have.
 
-Current state: **1272 passed, 0 failed, 6 negative controls, 9/9 suites green**,
+Current state: **1324 passed, 0 failed, 7 negative controls, 9/9 suites green**,
 both backends compile `rc=0` against real LWJGL sources, and the reference
 pack `packs/AuraLite-Native` lints clean and runs a NULL frame with 0
 violations.

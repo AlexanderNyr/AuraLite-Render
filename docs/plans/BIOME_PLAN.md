@@ -96,18 +96,11 @@ B5 is done when these exist as test output, on the NULL backend, no GPU:
    `BiomeSampler`'s eight-corner result **exactly** (same ids, weights within
    the renormalisation epsilon). This is the honesty gate: if the shader rule
    and the CPU rule ever diverge, this fails by name.
-<<<<<<< ours
-2. **Width**: with `R = 2`, a probe that walks a straight line across a
-   two-biome border reports the blended band spanning **>= 8 blocks** (today
-   it spans exactly 4), and the band is monotonic — no oscillation, weights
-   sum to 1 everywhere.
-=======
 2. **Width**: the band spans `(2R + 1)` cells. At `R = 0` that is one cell
    (4 blocks, today's seam); at `R = 2` it is five cells (20 blocks). The probe
    walks a straight line across a two-biome border and counts blended
    positions; the widened count must exceed the sampler's, and the band must
    be monotonic — weights descending, summing to 1 everywhere.
->>>>>>> theirs
 3. **Determinism**: two runs of the same field produce byte-identical
    `TOPK_RGBA8UI` output. The coalescing is already deterministic by
    construction; the blur must be too, which means a fixed traversal order and
@@ -139,14 +132,6 @@ pixel hash in the receipt like every other frame gate.
   today's one-cell seam. B5 is a native-pack capability, gated by the pack
   declaring the resource — the same rule every other capability follows.
 
-<<<<<<< ours
-## Order of work (when the operator starts it)
-
-1. `biome_field.comp` producer + `PACK_FORMAT` lines for `BIOME_SEAM_R`
-   (option) — no behaviour change yet, gate 1 only.
-2. Blur radius plumbing + gate 2, refusals for gates 3-4.
-3. Fetch-count receipt (gate 5) and the `gpu-test` pixel hash on the GT 710.
-=======
 ## Order of work
 
 1. **DONE (r46) — the rule, in core, before any shader.** `BiomeSeam` states
@@ -469,9 +454,70 @@ pixel hash in the receipt like every other frame gate.
       blended cell is visibly desaturated - and the pack suite pins that
       sentence, so "the seam is visible" cannot quietly come to mean "an id
       palette is visible".
-    Still owed before B5 closes: the session log itself, a bake measured under
-    the frame budget on real terrain, and the bound-vs-unbound frame pair.
->>>>>>> theirs
+    **r61: the half nobody had written.** `CompiledGraph.allocate()` creates the
+    images a pack declares and writes none of them; the host bound the baked
+    volume to the frame and never uploaded it, so a world would have run the
+    `biome_field` pass over uninitialised device memory while the freshness gate
+    - two CPU integers - said `fresh=true`. `BiomeVolumeUpload` is the missing
+    half: one push per bake, the whole window, the pack's own layout, an extent
+    that is the bake's extent and not a second literal, and two named refusals
+    (`BIOME_VOLUME_EXTENT`, `BIOME_VOLUME_NOT_UPLOADED`). Two things this step
+    already measured: the fabric lane had NEVER been compiled (twelve errors
+    across four revisions, `make test` does not build it), and the fix for that
+    is a gate, not a habit - `gradle compileJava` in `fabric/` is now part of
+    closing a step. Still owed before B5 closes: the session log itself, a bake
+    measured under the frame budget on real terrain, and the bound-vs-unbound
+    frame pair.
+11. **r63 — the three defects the r62 run showed**, the first session that
+    reached the world rather than dying before it.
+    - **An empty window stamped itself as an answer.** r62's log says
+      `rebuilt from 0 of 529 chunk columns` and `0 filled / 51313 unknown`:
+      the first bake ran at spawn, before the client's chunk pool held a
+      column at the new position, so every column was refused — and because
+      the pass still stamped the window's cell, `needsRebuild` stayed false
+      and the field was never tried again for the rest of the session. An
+      unanswered pass now leaves the stamp off, retries on the throttle, and
+      keeps whatever the field already had; the reader counts its two refusal
+      reasons (`no-manager` — the accessor moved — and `no-chunk` — the world
+      simply has not streamed in yet) so a dead field names itself in the log.
+      Measured on the fixture: 529 refusals, then the same unmoved player
+      position fills 42 849 cells once the world answers.
+    - **`0xC0000409` came back**, and `auralite-trace-4.txt` says exactly
+      when: death on the first traced frame after the fourth reload, after
+      three reloads that each cost ~3.0 s on their first frame. The r42 fix
+      (cached attachment views and framebuffers surviving `VkImage.close()`)
+      was missing from the tree - the prose kept it, the code did not. The
+      rule is restored as `ResourceCacheOwnership` in core, where the host
+      suite can gate it (a negative control reddens the moment the stamp comes
+      back), and the receipt is on the rebuild line again: `imagesLive=…
+      released=… viewsTorn=… fbosTorn=…`, asked of the Vulkan device instead
+      of dropped because the GL backend has nothing to answer. A second,
+      timed `waitIdle` now sits between the new graph's uploads and the old
+      graph's release, because the drain at the top of `rebuild()` runs before
+      the pack load submits its own one-shots.
+    - **A receipt that invented a number.** The host printed
+      `ids().length * 4` as "ids packed (401 764 B)" beside an upload of
+      205 252 bytes: 23x97x23 cells is 51 313 cells, and the `r32_uint`
+      layout moves one int per cell - 401 764 is the `r32g32_uint` figure.
+      Bytes now come from the upload's own `UploadState`, with the layout
+      named next to them, and `packedBytes()` states the size for whichever
+      layout the image actually has.
+    - **The validation path existed only to crash.** The r62 messenger
+      passed a null callback through LWJGL's generated setter, which
+      dereferences it: `AURALITE_VK_VALIDATION=1` died inside
+      `createMessenger` before any Vulkan call, and `make gpu-test` (which
+      defaults the flag ON) had been skipped for two revisions. The layer
+      stays - it prints to stderr and turns violations into failing result
+      codes - and the messenger is gone by decision, recorded at the code.
+    - Added so the next run can pay the acceptance in full: `present/frame:
+      sha256=… bytes=WxH center=…` every 600 frames while present is on, a
+      hash of the whole pack output rather than one centre pixel once per
+      session. Acceptance for this step, none of it claimed: a session log
+      where the window receipt is filled (not `0 filled`), the retry count is
+      visible, every F9 rebuild line shows `viewsTorn=` > 0 with a bounded
+      `drained before release (…)`, at least two `present/frame` hashes exist
+      with the first taken before the window fills, and the run ends with exit
+      0 instead of a driver fault.
 
 Nothing here starts before this document exists. That is the rule the roadmap
 set, and it is the reason the last four revisions closed actual defects instead

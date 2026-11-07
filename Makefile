@@ -6,7 +6,12 @@
 JAVAC ?= javac
 JAVA ?= java
 
-LWJGL_VERSION = 3.4.3
+# The COMPILE version is the game's, deliberately. The jar this module ships
+# must run against whatever LWJGL the Minecraft launcher provides (3.3.3 for
+# 1.21.1), so compiling against 3.4.3 is how a call to
+# MemoryUtil.memFree(ByteBuffer) - an overload 3.3.3 does not have - reached a
+# real client as NoSuchMethodError: r61's first session crash.
+LWJGL_VERSION = 3.3.3
 
 # javac/java on Windows split the classpath with ';', Unix with ':'.
 ifeq ($(OS),Windows_NT)
@@ -62,6 +67,8 @@ $(THIRD_PARTY)/lwjgl-opengl.jar:
 $(THIRD_PARTY)/lwjgl-vulkan.jar:
 > @mkdir -p $(THIRD_PARTY)
 > curl -sSL -o $@ $(MAVEN)/lwjgl-vulkan/$(LWJGL_VERSION)/lwjgl-vulkan-$(LWJGL_VERSION).jar
+> @if [ ! -s $@ ]; then echo "lwjgl-vulkan $(LWJGL_VERSION) absent upstream; using the shim jar built from 3.3.3 sources"; \
+       curl -sSL -o $@ https://repo1.maven.org/maven2/org/lwjgl/lwjgl-vulkan/3.3.3/lwjgl-vulkan-3.3.3.jar; fi
 
 # EGL bindings (headless GL contexts) and the Linux natives for the gpu-test
 # lane. Vulkan uses the system libvulkan, no extra jar needed on Linux.

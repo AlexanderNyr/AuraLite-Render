@@ -26,25 +26,28 @@ repositories {
     mavenCentral()
 }
 
-// LWJGL 3.4.3 is a multi-release jar: META-INF/versions/27 ships class-file
-// major 71, which tiny-remapper's ASM refuses ("Unsupported class file major
-// version 71") while remapJar analyzes the compile classpath. The host javac
-// lane is happy with the raw jars; the loom lane gets stripped copies with
-// only the base (Java 8/11) classes - which is all this module compiles
-// against anyway.
-def lwjglStrippedDir = layout.buildDirectory.dir('lwjgl-stripped').get().asFile
-def strippedTasks = ['lwjgl', 'lwjgl-opengl', 'lwjgl-vulkan'].collect { base ->
-    def taskName = "strip-${base}"
-    tasks.register(taskName, Zip) {
-        from({ zipTree("../third_party/${base}.jar").matching { exclude 'META-INF/versions/**' } })
-        archiveFileName = "${base}-stripped.jar"
-        destinationDirectory = lwjglStrippedDir
-    }
-    taskName
-}
-def strippedLwjgl = ['lwjgl', 'lwjgl-opengl', 'lwjgl-vulkan'].collect {
-    new File(lwjglStrippedDir, "${it}-stripped.jar")
-}
+// The COMPILE version is the game's (3.3.3 for 1.21.1), and the classpath is
+// the game's jars DIRECTLY - no "stripped" copies.
+//
+// Both halves of that sentence are r61 lessons, paid for on a real client:
+//  * compiling against 3.4.3 produced a jar that called
+//    MemoryUtil.memFree(ByteBuffer), which 3.3.3 does not have, and the game
+//    died with NoSuchMethodError on the first frame. The jar must be built
+//    against the ABI it will run on;
+//  * the stripped copies were a second, silent copy of the same mistake: a Zip
+//    task with undeclared inputs is never UP-TO-DATE and can be reused stale, so
+//    the classpath still held 3.4.3 after third_party/ changed. 3.3.3's
+//    multi-release entries are Java 8/11 classes (that is what "compiled for
+//    8" means for a multi-release jar), so the reason the stripping existed is
+//    gone with the version bump - and with it the way the build could lie.
+//
+// The Vulkan module is the paired 3.3.3 jar: the game ships none at all (vanilla
+// is GL-only), so those classes ride into the jar below.
+def lwjglJars = [
+        file('../third_party/lwjgl.jar'),
+        file('../third_party/lwjgl-opengl.jar'),
+        file('../third_party/lwjgl-vulkan-3.3.3.jar'),
+]
 
 // The game ships LWJGL 3.3.3 without the Vulkan module (vanilla is GL-only),
 // so `new VkDevice()` dies with NoClassDefFoundError on
@@ -71,19 +74,7 @@ dependencies {
     // published artifacts, no Gradle in the host lane. LWJGL is compile-time
     // only here; the game provides it at runtime (see gradle.properties).
     // Stripped copies: see the multi-release note above.
-    compileOnly files(strippedLwjgl)
-}
-
-compileJava {
-    dependsOn strippedTasks
-}
-
-// Every consumer of the compile classpath (jar, remapJar, remapSourcesJar,
-// sourcesJar, ...) must wait for the stripped copies; declare it once.
-tasks.configureEach { t ->
-    if (!t.name.startsWith('strip-')) {
-        t.dependsOn strippedTasks
-    }
+    compileOnly files(lwjglJars)
 }
 
 processResources {

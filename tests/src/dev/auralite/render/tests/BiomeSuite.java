@@ -18,6 +18,8 @@ import dev.auralite.render.biome.BiomeRecord;
 import dev.auralite.render.biome.BiomeRegistry;
 import dev.auralite.render.biome.BiomeSample;
 import dev.auralite.render.biome.BiomeSampler;
+import dev.auralite.render.biome.BiomeWindowSource;
+
 import dev.auralite.render.biome.DirtyRegion;
 import dev.auralite.render.uniform.CustomUniformTable;
 import dev.auralite.render.uniform.ExprEnv;
@@ -1218,6 +1220,95 @@ public final class BiomeSuite {
             }
         });
 
+        // r63 wrote this block onto the two `window.receipt()` checks the r61/r62
+        // "world window" section ended with. The rollback restored a BiomeSuite without it
+        // (no `window`, no sea-level constants), so the block stands on its own and rides
+        // the next section line the file really has.
+
+        // r62's session log: the first bake ran at spawn, before a single
+        // chunk had reached the client, every column was refused, and the
+        // window was stamped "built" anyway - so the seam stayed empty for the
+        // rest of the session even though the world arrived seconds later. An
+        // empty answer must never be recorded as an answer.
+        section("world window: an empty world is a retry, not a result");
+        final boolean[] worldLoaded = { false };
+        BiomeField retryField = new BiomeField(4);
+        retryField.allocate(23, 97, 23);
+        BiomeWindowSource retryWindow = new BiomeWindowSource(retryField,
+                new BiomeWindowSource.BlockSampler() {
+                    @Override public int idAt(int bx, int by, int bz) {
+                        throw new IllegalStateException("a column-shaped world never asks per block");
+                    }
+                    @Override public boolean hasColumns() { return true; }
+                    @Override public int[] column(int chunkX, int chunkZ, int cellSize, int cellY) {
+                        if (!worldLoaded[0]) return null;   // the client has nothing yet
+                        int[] col = new int[384];
+                        for (int i = 0; i < col.length; i++) {
+                            col[i] = (dev.auralite.render.biome.BiomeField.MIN_BLOCK_Y + i) < colSeaLevel
+                                    ? lowBiome : highBiome;
+                        }
+                        return col;
+                    }
+                }, 23, 97, 23);
+        int firstChanged = retryWindow.rebuild(0, 64, 0, 1_000);
+        eq(firstChanged, 0, "a world with no chunks answers no change");
+        eq(retryWindow.lastColumnsRefused(), 23L * 23L,
+                "and the receipt counts the refused columns, not the 529x97 cells behind them");
+        TestRig.contains(retryWindow.lastOutcome(), "retry",
+                "the outcome names the retry - an empty field with no retry is the r62 dead end");
+        // r64: the FIRST unanswered pass is the one the live log got wrong. r63's
+        // guard required prior data (`builds > 0 || filledCells > 0`), which is
+        // false at spawn, so the empty pass fell through to the answered path,
+        // counted itself a build, and armed a throttle for a retry nobody had
+        // asked for yet - and the receipt that printed "0 empty-window
+        // retry(ies)" was read out of that pass. Both halves are gated here.
+        eq(retryWindow.builds(), 0,
+                "an unanswered pass from an EMPTY field completes no build either");
+        check(retryWindow.retriesAfterEmptyWindow() >= 1,
+                "and it is already counted as a retry, not as a result");
+        eq(retryWindow.lastColumnsRefused(), 23L * 23L,
+                "with the refusals in the number the receipt will print");
+        retryWindow.updateFrom(0, 64, 0, 1_030);          // same cell, throttle passed
+        check(retryWindow.retriesAfterEmptyWindow() >= 1,
+                "the player never moved and the window still asked again");
+        check(retryWindow.needsRebuild(0, 64, 0),
+                "an unanswered window is NOT stamped as covering the player's cell");
+        worldLoaded[0] = true;
+        int laterChanged = retryWindow.updateFrom(0, 64, 0, 1_060);
+        check(laterChanged > 0,
+                "and once the chunks exist the same position fills the field ("
+                        + laterChanged + " cells changed)");
+        check(retryField.filledCells() > 0, "the field holds data, not holes");
+        check(!retryWindow.needsRebuild(0, 64, 0),
+                "a filled window earns its stamp and goes quiet until the next cell crossing");
+        TestRig.contains(retryWindow.lastOutcome(), "chunk columns",
+                "and the outcome still reads as a column rebuild");
+        eq(retryWindow.builds(), 1,
+                "only the answered pass counts as a build, so a receipt that reads "
+                        + "one rebuild(s) over a filled field means one bake did the work");
+        receipt("empty window: " + retryWindow.retriesAfterEmptyWindow()
+                + " retry(ies) before the world answered, then " + retryField.filledCells()
+                + " filled cells at an unmoved player");
+
+        negativeControl("an unanswered window that stamps itself built", new Runnable() {
+            @Override public void run() {
+                BiomeField stamped = new BiomeField(4);
+                stamped.allocate(4, 4, 4);
+                BiomeWindowSource neverAnswered = new BiomeWindowSource(stamped,
+                        new BiomeWindowSource.BlockSampler() {
+                            @Override public int idAt(int bx, int by, int bz) { return -2; }
+                            @Override public boolean hasColumns() { return true; }
+                            @Override public int[] column(int cx, int cz, int cs, int cy) { return null; }
+                        }, 4, 4, 4);
+                neverAnswered.rebuild(0, 0, 0, 1);
+                // The claim under test: after a pass with zero answered
+                // columns the window still covers the player. It must not - so
+                // this check fails while the fix holds, and would pass (and be
+                // reported as a useless control) if the stamp came back.
+                check(!neverAnswered.needsRebuild(0, 0, 0),
+                        "an empty window counts as built");
+            }
+        });
         section("ingest from chunk sections");
         BiomeField live = new BiomeField();
         BiomeFieldBuilder builder = new BiomeFieldBuilder(live);

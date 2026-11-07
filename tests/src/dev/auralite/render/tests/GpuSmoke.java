@@ -558,6 +558,18 @@ public final class GpuSmoke {
         };
     }
 
+    /**
+     * The compiler to run: {@code -Dauralite.glslang} names one, and an empty or
+     * missing value falls back to the PATH - the same order the fabric lane's
+     * SpirvCompiler uses, so one property drives both.
+     */
+    static String glslang() {
+        String prop = System.getProperty("auralite.glslang");
+        if (prop != null && !prop.isEmpty()) return prop;
+        return System.getProperty("os.name", "").toLowerCase(java.util.Locale.ROOT)
+                .contains("win") ? "glslangValidator.exe" : "glslangValidator";
+    }
+
     /** VK lane: compile every pack stage to SPIR-V with glslangValidator first. */
     static PipelineProvider spirvProvider(final GfxDevice dev, final PackManifest manifest)
             throws Exception {
@@ -660,7 +672,7 @@ public final class GpuSmoke {
             Files.write(in, text.getBytes(StandardCharsets.UTF_8));
             Path out = dir.resolve(safe + "." + stageArg + ".spv");
             ProcessBuilder pb = new ProcessBuilder(
-                    "glslangValidator", "-V", "-S", stageArg, "-o", out.toString(), in.toString());
+                    glslang(), "-V", "-S", stageArg, "-o", out.toString(), in.toString());
             pb.redirectErrorStream(true);
             Process proc = pb.start();
             byte[] log = proc.getInputStream().readAllBytes();

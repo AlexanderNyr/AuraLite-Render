@@ -1,3 +1,49 @@
+- **r63: the receipt said a number no buffer held, the plan file had merge
+  markers, and the r42 teardown was gone** (2026-11-07). The r62 run is the
+  first session that reached the world instead of dying before it: the
+  NoSuchMethodError is closed, the pack survived 600/1200/1800-frame
+  heartbeats, and the seam upload printed
+  `upload=v2 bytes=205252 nanos=600500`. Three things that run exposed:
+  (1) `biome/bake` says `rebuilt from 0 of 529 chunk columns ... 0 filled /
+  51313 unknown` - the first bake ran at spawn with an empty client chunk
+  pool, stamped the window as built anyway, and never retried; fixed by
+  making an unanswered pass leave the stamp off and retry on the throttle,
+  with `no-manager` / `no-chunk` refusal counts so a dead field names its
+  reason. (2) the process died again with `0xC0000409`, and
+  `auralite-trace-4.txt` puts the death on the FIRST frame after the fourth
+  F9 reload - after three rebuilds that each cost ~3.0 s on their first
+  frame; the r42 fix for exactly this (cached attachment views and
+  framebuffers surviving `VkImage.close()`) is not in the tree, only in the
+  prose. Restored as `ResourceCacheOwnership` in core (host-gated, with a
+  negative control) plus a timed `waitIdle` between the new graph's uploads
+  and the old graph's release, and the rebuild line asks the Vulkan device
+  for `imagesLive= released= viewsTorn= fbosTorn=` again. The purge is keyed
+  on identity, not membership: an owned view or framebuffer is destroyed only
+  while the cache still holds that same object under that key. The first cut
+  swept `framebufferCache.remove(handle)` instead, which evicted a still-live
+  framebuffer that merely shared the handle and let the next `close()` destroy
+  it twice - `make gpu-test` failed 3/3 runs on that version and answers 3/3
+  with 0 validation violations on this one. (3) the bake line
+  printed `51313 ids packed (401 764 B)` beside an upload of 205 252 bytes -
+  23x97x23 cells is 51 313 cells and the pack's `r32_uint` layout moves one
+  int per cell: 401 764 is the `r32g32_uint` figure, i.e. a number no buffer
+  held. Bytes now come from the upload state, with the layout named;
+  `present/frame: sha256=…` now hashes the whole pack output every 600
+  frames, because one centre pixel once per session is not a frame receipt.
+  Also closed while measuring: `AURALITE_VK_VALIDATION=1` could not be
+  enabled at all (the r62 `pfnUserCallback(null)` spelling NPEs inside
+  LWJGL 3.3.3 before any Vulkan call) - the validation layer stays, the
+  messenger is gone by decision, and the gate that exercises it
+  (`make gpu-test`, which defaults the flag ON) is back in the closing
+  sequence. `docs/plans/BIOME_PLAN.md` had unresolved `<<<<<<< ours` /
+  `>>>>>>> theirs` markers committed into it; they are resolved and step 11
+  is added. Gates: `make test` **1320/0**, 7 NC, 9/9 (rhi 59, biome 301,
+  fabric 46), `make gpu-test` vk+gl answered (3/3, 0 violations), `drift-check` PASS,
+  `packlint --strict` OK, `gradle compileJava` + `remapJar` green.
+  B5 stays OPEN: the world frame pair and a filled-window session log are
+  still owed, and no frame is claimed that this run did not measure.
+
+
 # AuraLite-Render — status
 
 Date: 2026-11-01. Host: OpenJDK 11, Linux x86_64, 2 CPUs.
@@ -6,16 +52,16 @@ Every number below is measured by `make test`, not estimated.
 ## Host gates: 9/9 green
 
 ```
-rhi         51 passed   0 failed   0 NC   PASS
-graph       90 passed   0 failed   1 NC   PASS
-uniform     91 passed   0 failed   0 NC   PASS
-biome      277 passed   0 failed   4 NC   PASS
-nulldev    115 passed   0 failed   0 NC   PASS
-pack       209 passed   0 failed   0 NC   PASS
-tables     340 passed   0 failed   0 NC   PASS
-fabric      30 passed   0 failed   0 NC   PASS
-view         69 passed   0 failed   1 NC   PASS
-TOTAL 1272 passed, 0 failed, 6 negative controls, 9/9 suites green
+rhi             63 passed   0 failed   0 NC PASS
+graph           90 passed   0 failed   1 NC PASS
+uniform         91 passed   0 failed   0 NC PASS
+biome          290 passed   0 failed   5 NC PASS
+nulldev        115 passed   0 failed   0 NC PASS
+pack           209 passed   0 failed   0 NC PASS
+tables         340 passed   0 failed   0 NC PASS
+fabric          57 passed   0 failed   0 NC PASS
+view            69 passed   0 failed   1 NC PASS
+TOTAL 1324 passed, 0 failed, 7 negative controls, 9/9 suites green
 RESULT: PASS
 ```
 
@@ -820,7 +866,7 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   frames. NOT claimed: a receipt from a real Minecraft session - the windowed
   gate needs a JDK 21, a GPU and a world, and standing rule 4 says no frame is
   claimed until one has been.
-  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  Gates: `make test` 1290/0, 6 negative controls, 9/9 (biome 292, pack 209);
   `make shader-check` PASS on three packs; `packlint --strict --null-device`
   OK on all three (the probe and its siblings; the reference pack also now
   receives a host-uploaded 23x97x23 field, and its hash is unchanged because
@@ -861,7 +907,7 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   (`ceil(width/8) x ceil(height/8) x 1` groups), so reading the volume's middle
   slab reads a slab nobody wrote; and `scene_color` is a render target, so a
   stage that wants it declares `sampler2D` against `usage=color|sampled`.
-  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  Gates: `make test` 1290/0, 6 negative controls, 9/9 (biome 292, pack 209);
   `make shader-check` PASS; `make drift-check` PASS; `gpu-test LANE=vk` and
   `LANE=gl` both RENDERED with the same hash, and the volume-driven receipt
   printed on both.
@@ -888,10 +934,135 @@ GPU SMOKE: vk answered, gl answered (answered = RENDERED or refused/skipped BY N
   reference pack - the weighted sum of the biomes the cell holds, so a blend is
   visibly desaturated. NOT claimed: a session log. B5 stays open until one
   exists (standing rule 4).
-  Gates: `make test` 1272/0, 6 negative controls, 9/9 (biome 277, pack 209);
+  Gates: `make test` 1290/0, 6 negative controls, 9/9 (biome 292, pack 209);
   `gpu-test LANE=vk` and `LANE=gl` RENDERED with the same hash and the
   volume-driven receipt on both.
 
+  THE SEAM REACHES THE DEVICE, r61 - and the first thing that had to be
+  admitted is that the mod had never been compiled. `make test` does not touch
+  `fabric/` (the Makefile prints `fabric: JDK present ... not part of make`), so
+  twelve compile errors had accumulated over four revisions of a lane that no
+  gate covers: a receipt naming a variable that did not exist, three `VkDevice`
+  counters that belong to the upstream backend, and two Minecraft API calls that
+  1.21.1 does not have (`Chunk.getBiome(BlockPos)` is `WorldView`'s;
+  `ClientChunkManager.getWorldChunk` does not exist either, `getChunk(x, z,
+  BIOMES, false)` is the do-not-load call). All twelve are fixed against the
+  yarn 1.21.1 jar rather than against memory, and `gradle compileJava` in
+  `fabric/` is now run explicitly - a green `make test` says nothing about
+  whether the mod builds.
+  What the compile then exposed is the hole standing rule 4 exists for:
+  `CompiledGraph.allocate()` creates every owned image and writes none of them,
+  and the fabric host bound the volume to the frame without ever uploading it.
+  In a world the `biome_field` pass would have read uninitialised device
+  memory - random ids, a different picture per run - while the freshness gate
+  reported `fresh=true`, because it only ever compared two CPU integers. The
+  fixture lane looked fine because the GPU smoke uploads its own field by hand.
+  `BiomeVolumeUpload` closes it: one push per bake (paced with the bake, skips
+  counted), the whole window in one transfer, `r32_uint` or the packed
+  `r32g32_uint` the pack declares, an extent mismatch refused by name
+  (`BIOME_VOLUME_EXTENT`) instead of half-filled, and a `NOT_UPLOADED` refusal a
+  consumer can raise. The extent itself stopped being two numbers that agreed
+  by hand: the graph is built from `WorldBiomeSource.cellExtent()`, the same
+  constants the bake uses.
+  Evidence, and its exact limits: `make test` 1287/0, 6 negative controls, 9/9
+  (biome 292, pack 209) with the new section proving a push reaches a real
+  `NullDevice` (1 upload, 401 764 B for 23x97x23, the field version quoted
+  back), a skip for an unchanged bake, a second push after a field write, and
+  the two refusals by name; `make drift-check` PASS; `packlint --strict` OK on
+  four packs; `gradle compileJava` BUILD SUCCESSFUL in 121 s on JDK 21 with
+  loom 1.10.5. NOT claimed, and unchanged by any of this: a session log. The
+  upload is proven to reach a device, not to reach a window, and nothing here
+  says the seam is visible in a world - B5 stays open.
+
+## r64 - the five things the r63 live log proved, and what the rollback cost
+
+The operator's run (`uploads/auralite-trace-5.txt`, 2140 lines, PrismLauncher,
+GT 710, `-Dauralite.backend=vk`, 1280x720, world at 73.085/150.859/393.937,
+badlands + wooded_badlands) closed nothing. It exposed five defects, and this
+round fixes all five in code, with a gate for each.
+
+1. **`viewsTorn=0` on all five rebuilds while `cachedViews` climbed
+   5 -> 9 -> 13 -> 17 -> 21.** The teardown removed VIEW HANDLES from a cache
+   keyed by view KEY, so `remove` returned null, the identity guard `continue`d,
+   and no view was destroyed: a growing set of views onto freed images, which is
+   the state `nvoglv64.dll` dies in. `purgeCachesForImage` now walks the cache by
+   entry and matches it against the values the ownership purge returns, so each
+   view is destroyed exactly once and its key goes with it. A third refusal
+   reason - `viewsUnattributed` - counts an image whose ownership named nothing
+   while the cache is non-empty, so a broken ATTACH side cannot hide behind a
+   zero that reads like "nothing to do". `owns(Object key)` stays on the books in
+   `ResourceCacheOwnership` (gated in `RhiSuite`) as the keyed question the next
+   sweep will ask.
+2. **`0 empty-window retry(ies)` printed next to `window NOT stamped, retry
+   due`.** r63's guard on the retry path required prior data
+   (`builds > 0 || field.filledCells() > 0`), which is FALSE at spawn - the one
+   moment the retry exists for. The first unanswered pass fell through to the
+   answered path, counted itself a build, and armed a throttle for a retry nobody
+   had asked for. The guard is gone: an unanswered pass completes nothing, and
+   `BiomeSuite` pins `builds == 0` with `retriesAfterEmptyWindow >= 1` on exactly
+   that first pass.
+3. **One bake receipt per session, read out of the FIRST bake** - the bake where
+   an empty world is normal. It re-arms whenever the answer changes, so the line
+   in the log can only come from a pass that says something.
+4. **`529 column(s) refused` against `refused: 0 no-manager, 0 no-chunk`.** A
+   refusal that nobody attributed gets its own bucket (`unattributed`) and is
+   printed, so the two numbers can no longer disagree by construction.
+5. **The old graph was released inside the rebuild call**, frames before the
+   frames that had queued work against it. It is parked in `rebuild` and freed
+   after `RELEASE_GRACE_FRAMES = 2` frames, BEFORE that frame's `beginFrame`,
+   and the deferral is receipted:
+   `release timing: N deferral(s), longest M frame(s) (grace 2)`.
+
+Gates, on THIS tree: `make test` 1324/0, 7 negative controls, 9/9 suites green
+(`rhi 63 | graph 90 | uniform 91 | biome 290 | nulldev 115 | pack 209 | tables
+340 | fabric 57 | view 69`); `make gpu-test` with the VK lane RENDERING (biome
+field uploaded, 50 commands, 14 barriers, 6 passes, **0 violations**, pixels
+sha256 `c635d4906ec10a94`, and main's fuller probe also confirms the terrain pass
+really samples the volume - `volume-driven: c635d4906ec10a94 !=
+4a75f3b149347026`, which is the direction that check demands) and the GL lane
+refusing 4.6 by name; `make packlint` OK; `make drift-check` PASS. `GpuSmoke` now honours
+`-Dauralite.glslang` the way `SpirvCompiler` does, so the VK lane can be pointed
+at a compiler that is not on `PATH` - without it this host answers
+REFUSED-NAMED and the purge this round changed is never exercised.
+
+**Why these totals are larger than the sandbox's r64 entry.** The entry above was
+written in a workspace whose snapshot had just rolled `tests/` back to r20, so it
+measured 1142/4 with `biome 155` - a smaller GATE SET, not a smaller revision.
+This tree is the same code replayed onto the `tests/` that GitHub's `main`
+carries: the r63 and r64 gates were re-applied through the revision scripts
+(`r63-tests.py`, `r64-tests.py`) rather than by hand, one duplicated declaration
+was dropped (`colSeaLevel / lowBiome / highBiome` already exist in `main`'s
+`BiomeSuite` world-window section, so the retry gate no longer re-declares them),
+and `main`'s fuller `GpuSmoke`/`PackSuite`/`BiomeSuite` sections stayed. 1324/7
+is what r63's 1320/7 grows to once the empty-window retry gate, the ownership
+gate, the receipts gate and the r64 assertions sit on top of it - which is the
+comparison worth keeping, not the sandbox number.
+
+**Not claimed.** That any of this fixes the crash: the run still ended at
+`-1073740791` right after `debug view -> 1 (luma)`, and plan step 11 stays open
+until a log shows a filled window and a reload-free teardown. Also open, and now
+the louder problem: at `DEBUG_VIEW=0` the pack's own output was BLACK while views
+1 and 3 showed content - that is the `taa_cur` resolve chain inside the pack, not
+the capture, and step 10's frame-pair comparison cannot be run until it is fixed.
+
+**Found by the jar build, not by any gate.** `remapJar`'s `:compileJava` stopped
+on `method refusalReasons() is already defined in class WorldBiomeSource`: r64's
+third-reason edit inserted the three-counter method *beside* the two-element one
+it superseded, because its anchor ended above the old method instead of covering
+it. No host gate can catch that - `make build` compiles `core`/`null`/`gl`/`vk`
+and reports `fabric: SKIP - needs JDK 21`, and the suites compile against `core`,
+not the mod - so between that edit and this line the r64 fabric module had never
+been compiled at all. Removed as `reader: one refusalReasons, three counters` in
+`r64-apply.py`. The lesson is the boring one: the gradle lane is a gate like any
+other, and `make build` + `make test` being green does not mean the jar builds.
+
+One tool-level change came out of the same episode: the r63 script's
+`reader: refusalReasons` insertion now skips on `long[] refusalReasons()` rather
+than on its own exact text. An insertion whose anchor survives the insertion is
+not idempotent unless it declares a marker, and re-running it on a tree that
+already had r64's method re-created the duplicate. The rule is recorded in
+`r63-apply.py`'s `sub()` comment: every inserting edit names what its own result
+looks like.
 Standing rule: host-buildable code stays Java 11 source-compatible so `make test`
 is genuinely green here. `third_party/` holds gitignored LWJGL 3.4.3 jars fetched
 by `make deps` (~11 MB); they are compile-only and never committed.

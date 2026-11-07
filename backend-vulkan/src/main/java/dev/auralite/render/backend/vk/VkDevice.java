@@ -25,6 +25,8 @@ import dev.auralite.render.util.MathUtil;
 import java.nio.ByteBuffer;
 import java.nio.FloatBuffer;
 import java.nio.IntBuffer;
+import dev.auralite.render.util.ResourceCacheOwnership;
+
 import java.nio.LongBuffer;
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -48,7 +50,6 @@ import org.lwjgl.vulkan.VkCommandBufferAllocateInfo;
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo;
 import org.lwjgl.vulkan.VkComputePipelineCreateInfo;
 import org.lwjgl.vulkan.VkDebugUtilsMessengerCallbackDataEXT;
-import org.lwjgl.vulkan.VkDebugUtilsMessengerCallbackEXT;
 import org.lwjgl.vulkan.VkDebugUtilsMessengerCreateInfoEXT;
 import org.lwjgl.vulkan.VkDescriptorBufferInfo;
 import org.lwjgl.vulkan.VkDescriptorImageInfo;
@@ -76,7 +77,6 @@ import org.lwjgl.vulkan.VkPhysicalDeviceAccelerationStructureFeaturesKHR;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures;
 import org.lwjgl.vulkan.VkPhysicalDeviceFeatures2;
 import org.lwjgl.vulkan.VkPhysicalDeviceHostQueryResetFeaturesEXT;
-import org.lwjgl.vulkan.VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceMeshShaderFeaturesEXT;
 import org.lwjgl.vulkan.VkPhysicalDeviceProperties2;
 import org.lwjgl.vulkan.VkPhysicalDeviceRayQueryFeaturesKHR;
@@ -122,8 +122,6 @@ import static org.lwjgl.vulkan.EXTDebugUtils.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSE
 import static org.lwjgl.vulkan.EXTMeshShader.VK_EXT_MESH_SHADER_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTMeshShader.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT;
 import static org.lwjgl.vulkan.KHRAccelerationStructure.VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR;
-import static org.lwjgl.vulkan.EXTVertexAttributeRobustness.VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME;
-import static org.lwjgl.vulkan.EXTVertexAttributeRobustness.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT;
 import static org.lwjgl.vulkan.EXTHostQueryReset.VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME;
 import static org.lwjgl.vulkan.EXTHostQueryReset.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_HOST_QUERY_RESET_FEATURES_EXT;
 import static org.lwjgl.vulkan.KHRDeferredHostOperations.VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME;
@@ -146,16 +144,26 @@ import static org.lwjgl.vulkan.VK13.*;
  * behind these walls so a later version can fix them without touching callers.
  *
  * <p>Set {@code AURALITE_VK_VALIDATION=1} to enable the Khronos validation
- * layer with a stderr messenger. Every message it prints is a bug in this
- * file until proven otherwise.
+ * layer, which prints its findings to stderr and makes every call return a
+ * failing result code ({@code make gpu-test} runs with it ON by default).
+ * Every message it prints is a bug in this file until proven otherwise. There
+ * is deliberately no debug messenger - see {@link #validationEnabled()}.
  */
 public final class VkDevice implements GfxDevice {
+
+    /**
+     * VK_EXT_vertex_attribute_robustness, by name: the constants that would
+     * spell it live in LWJGL versions newer than the game's pinned 3.3.3, and a
+     * jar that compiles against them dies on a real client.
+     */
+    private static final String EXT_VERTEX_ATTRIBUTE_ROBUSTNESS =
+            "VK_EXT_vertex_attribute_robustness";
 
     private final VkInstance instance;
     private final VkPhysicalDevice physicalDevice;
     private final org.lwjgl.vulkan.VkDevice device;
-    private final long debugMessenger;
-    private final VkDebugUtilsMessengerCallbackEXT debugCallback;
+    /** Whether the Khronos validation layer was enabled for this instance. */
+    private final boolean validationLayerEnabled;
 
     private final int graphicsFamily;
     private final int computeFamily;
@@ -191,6 +199,24 @@ public final class VkDevice implements GfxDevice {
     /** Image handle -> current VkImageLayout, for barrier construction. */
     private final Map<Long, Integer> imageLayouts = new HashMap<Long, Integer>();
 
+    /**
+     * The r42 teardown, restored. Every cached attachment view and every cached
+     * framebuffer names the image handles it was built from, so closing an image
+     * drops the entries that reference it instead of leaving a live view of a
+     * freed VkImage in a device-wide cache. Keys are the same hashes
+     * {@link #viewFor} / {@link #framebufferFor} already compute; ownership is
+     * tracked by handle because a handle is unique among LIVE images, which is
+     * exactly the window in which a stale hit would be a use-after-free.
+     */
+    private final ResourceCacheOwnership<Long, Long> viewOwners =
+            new ResourceCacheOwnership<Long, Long>();
+    private final ResourceCacheOwnership<Long, Long> framebufferOwners =
+            new ResourceCacheOwnership<Long, Long>();
+    private long imagesReleased;
+    private long viewsTorn;
+    private long fbosTorn;
+    private long viewsUnattributed;
+
     private final long transientPool;
     private final long graphicsPool;
     private final Map<Integer, Long> familyPools = new HashMap<Integer, Long>();
@@ -215,9 +241,8 @@ public final class VkDevice implements GfxDevice {
     public VkDevice() {
         try (MemoryStack stack = MemoryStack.stackPush()) {
             boolean validation = "1".equals(System.getenv("AURALITE_VK_VALIDATION"));
+            this.validationLayerEnabled = validation;
             this.instance = createInstance(stack, validation);
-            this.debugCallback = validation ? createDebugCallback() : null;
-            this.debugMessenger = validation ? createMessenger(stack) : 0L;
             this.physicalDevice = pickPhysicalDevice(stack);
             int[] families = findQueueFamilies(stack);
             this.graphicsFamily = families[0];
@@ -285,31 +310,37 @@ public final class VkDevice implements GfxDevice {
         return false;
     }
 
-    private static VkDebugUtilsMessengerCallbackEXT createDebugCallback() {
-        return VkDebugUtilsMessengerCallbackEXT.create(
-                (severity, type, callbackData, userData) -> {
-                    String message = VkDebugUtilsMessengerCallbackDataEXT.create(callbackData)
-                            .pMessageString();
-                    System.err.println("[auralite-vk] " + message);
-                    return VK_FALSE;
-                });
+    /**
+     * Whether the Khronos validation layer was enabled for this instance. The
+     * layer prints its own findings to stderr, which is the receipt
+     * {@code make gpu-test} quotes; a game session that sets the flag gets the
+     * layer without any work from us.
+     */
+    public boolean validationEnabled() {
+        return validationLayerEnabled;
     }
 
-    private long createMessenger(MemoryStack stack) {
-        VkDebugUtilsMessengerCreateInfoEXT ci = VkDebugUtilsMessengerCreateInfoEXT.calloc(stack)
-                .sType(VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT)
-                .messageSeverity(VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT
-                        | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT)
-                .messageType(VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT
-                        | VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT
-                        | VK_DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE_BIT_EXT)
-                .pfnUserCallback(debugCallback);
-        LongBuffer p = stack.mallocLong(1);
-        check(vkCreateDebugUtilsMessengerEXT(instance, ci, null, p), "vkCreateDebugUtilsMessengerEXT");
-        return p.get(0);
-    }
+    /*
+     * No debug messenger, and that is a decision rather than an omission.
+     * The LWJGL the game ships (3.3.3) cannot be handed a NULL callback
+     * through the generated struct - pfnUserCallback(null) dereferences the
+     * callback and throws before any Vulkan call, which is what the r62 tree
+     * shipped: AURALITE_VK_VALIDATION=1 died inside createMessenger, so the
+     * validation path was the one path that could not run, and the only gate
+     * that exercises it (make gpu-test, which defaults the flag ON) had been
+     * skipped for two revisions. Building a real closure is not available on
+     * that LWJGL either - VkDebugUtilsMessengerCallbackEXTI is not a
+     * functional interface there, so the anonymous class the fix would need
+     * does not compile.
+     *
+     * What the layer still does without a messenger: validate every call and
+     * print its findings to stderr, and return a failing result code to us -
+     * which check() turns into a named GfxException. Losing the in-process
+     * printf costs a prettier log line; keeping a crash-on-enable path costs
+     * the gate.
+     */
 
-    private VkPhysicalDevice pickPhysicalDevice(MemoryStack stack) {
+        private VkPhysicalDevice pickPhysicalDevice(MemoryStack stack) {
         IntBuffer count = stack.mallocInt(1);
         check(vkEnumeratePhysicalDevices(instance, count, null), "vkEnumeratePhysicalDevices(count)");
         if (count.get(0) == 0) throw new GfxException("vulkan backend: no physical devices at all");
@@ -383,10 +414,10 @@ public final class VkDevice implements GfxDevice {
         // (the world mesh is future work); GL returns the standard unbound
         // constant there, so Vulkan asks for the matching robustness feature
         // instead of leaving the read undefined (VUID Input-07904 named it).
-        boolean vertexRobust = availableExt.contains(VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME);
+        boolean vertexRobust = availableExt.contains(EXT_VERTEX_ATTRIBUTE_ROBUSTNESS);
         List<String> want = new ArrayList<String>();
         if (hostReset) want.add(VK_EXT_HOST_QUERY_RESET_EXTENSION_NAME);
-        if (vertexRobust) want.add(VK_EXT_VERTEX_ATTRIBUTE_ROBUSTNESS_EXTENSION_NAME);
+        if (vertexRobust) want.add(EXT_VERTEX_ATTRIBUTE_ROBUSTNESS);
         if (mesh) want.add(VK_EXT_MESH_SHADER_EXTENSION_NAME);
         if (ray) {
             want.add(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
@@ -448,13 +479,13 @@ public final class VkDevice implements GfxDevice {
                             .hostQueryReset(true);
             hostResetFeatures.pNext(head); head = hostResetFeatures.address();
         }
-        if (vertexRobust) {
-            VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT vertexRobustFeatures =
-                    VkPhysicalDeviceVertexAttributeRobustnessFeaturesEXT.calloc(stack)
-                            .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VERTEX_ATTRIBUTE_ROBUSTNESS_FEATURES_EXT)
-                            .vertexAttributeRobustness(true);
-            vertexRobustFeatures.pNext(head); head = vertexRobustFeatures.address();
-        }
+        // VK_EXT_vertex_attribute_robustness has no bindings in the LWJGL the
+        // game ships (3.3.3): the extension name and its feature struct arrived
+        // later than that. The extension is still REQUESTED by name when the
+        // device advertises it, which is what the enable does; the pNext feature
+        // struct cannot be built through these bindings, so it is not built -
+        // stated here rather than left as a compile-time surprise for whoever
+        // wires the next LWJGL bump.
         VkPhysicalDeviceFeatures2 features2 = VkPhysicalDeviceFeatures2.calloc(stack)
                 .sType(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
                 .features(enabled);
@@ -1055,6 +1086,73 @@ public final class VkDevice implements GfxDevice {
 
     @Override public long cpuTimeMillis() { return System.currentTimeMillis() - createdMillis; }
 
+    /**
+     * The teardown receipt for the host's rebuild log: live image count, the
+     * sizes of the two entry caches, and what has been torn down so far. A
+     * rebuild that frees images must move {@code viewsTorn} and {@code fbosTorn}
+     * - a rebuild that frees nine images and tears nothing is the r61/r62
+     * regression, and this line is what shows it in a session log.
+     */
+    public String cacheReceipt() {
+        return "imagesLive=" + liveImages.size()
+                + " cachedViews=" + viewCache.size() + " cachedFbos=" + framebufferCache.size()
+                + " | released=" + imagesReleased + " viewsTorn=" + viewsTorn
+                + " fbosTorn=" + fbosTorn
+                + (viewsUnattributed == 0 ? ""
+                        : " viewsUnattributed=" + viewsUnattributed);
+    }
+
+    /**
+     * Drops every cached view and framebuffer built from {@code handle} and
+     * destroys the objects. Called from {@code VkImage.close()}: the caches are
+     * device-wide and outlive a graph, so without this a released graph leaves
+     * live views of freed images behind, and the driver's first draw through
+     * one is a fault with no Vulkan error and no Java exception.
+     */
+    void purgeCachesForImage(long handle) {
+        imagesReleased++;
+        // Identity, not membership: an ownership entry is dropped only when it
+        // still names the object the cache holds under that key. A cache key
+        // that has since been overwritten by another object must not drag this
+        // one down with it - destroying a live view is the very fault this
+        // purge exists to prevent.
+        // `viewCache` is keyed by the VIEW KEY (image handle + subresource range)
+        // while `viewOwners.purge` answers with the HANDLES it held for the dying
+        // image, so r63's `viewCache.remove(view)` evicted nothing: the views of a
+        // freed image stayed cached under a key nobody would ever ask with again,
+        // their destroy was skipped, and the log read `viewsTorn=0` while
+        // cachedViews climbed 5 -> 21 rebuild after rebuild. A cache of views onto
+        // freed memory is the state nvoglv64.dll faults in, which is what the
+        // 0xC0000409 at the 5th reload was. Sweep by VALUE against the purge answer
+        // - each view destroyed once, by the sweep that also drops its key - and
+        // count the case where ownership named nothing, so a broken ATTACH side
+        // cannot hide behind a zero that looks like "nothing to do".
+        java.util.List<Long> dying = viewOwners.purge(Long.valueOf(handle));
+        if (!dying.isEmpty()) {
+            java.util.Iterator<java.util.Map.Entry<Long, Long>> views =
+                    viewCache.entrySet().iterator();
+            while (views.hasNext()) {
+                java.util.Map.Entry<Long, Long> e = views.next();
+                if (!dying.contains(e.getValue())) continue;
+                views.remove();
+                vkDestroyImageView(device, e.getValue(), null);
+                viewsTorn++;
+            }
+        } else if (viewCache.size() > 0) {
+            viewsUnattributed++;
+        }
+        for (Long fb : framebufferOwners.purge(Long.valueOf(handle))) {
+            if (!framebuffers.remove(fb)) continue;
+            vkDestroyFramebuffer(device, fb, null);
+            fbosTorn++;
+            for (java.util.Iterator<Map.Entry<Long, Long>> it = framebufferCache.entrySet().iterator();
+                 it.hasNext();) {
+                if (fb.equals(it.next().getValue())) it.remove();
+            }
+        }
+        imageLayouts.remove(handle);
+    }
+
     @Override public void close() {
         if (closed) return;
         closed = true;
@@ -1090,8 +1188,6 @@ public final class VkDevice implements GfxDevice {
         }
         familyPools.clear();
         vkDestroyDevice(device, null);
-        if (debugMessenger != 0) vkDestroyDebugUtilsMessengerEXT(instance, debugMessenger, null);
-        if (debugCallback != null) debugCallback.free();
         vkDestroyInstance(instance, null);
     }
 
@@ -1254,17 +1350,23 @@ public final class VkDevice implements GfxDevice {
         long key = framebufferKey(pass, renderPass);
         Long cached = framebufferCache.get(key);
         if (cached != null) return cached;
+        java.util.List<Long> attachmentHandles =
+                new java.util.ArrayList<Long>();
         try (MemoryStack stack = MemoryStack.stackPush()) {
             int colors = pass.colors.size();
             int hasDepth = pass.depth == null ? 0 : 1;
             LongBuffer views = stack.mallocLong(colors + hasDepth);
             for (int i = 0; i < colors; i++) {
                 GfxDesc.Attachment a = pass.colors.get(i);
-                views.put(i, viewFor(ownImage(a.image), a.mipLevel, a.baseLayer, a.layerCount));
+                VkImage img = ownImage(a.image);
+                attachmentHandles.add(img.handle);
+                views.put(i, viewFor(img, a.mipLevel, a.baseLayer, a.layerCount));
             }
             if (pass.depth != null) {
                 GfxDesc.Attachment a = pass.depth;
-                views.put(colors, viewFor(ownImage(a.image), a.mipLevel, a.baseLayer, a.layerCount));
+                VkImage img = ownImage(a.image);
+                attachmentHandles.add(img.handle);
+                views.put(colors, viewFor(img, a.mipLevel, a.baseLayer, a.layerCount));
             }
             VkFramebufferCreateInfo ci = VkFramebufferCreateInfo.calloc(stack)
                     .sType(VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO)
@@ -1275,6 +1377,7 @@ public final class VkDevice implements GfxDevice {
             check(vkCreateFramebuffer(device, ci, null, p), "vkCreateFramebuffer");
             framebuffers.add(p.get(0));
             framebufferCache.put(key, p.get(0));
+            framebufferOwners.attach(Long.valueOf(key), p.get(0), attachmentHandles);
             return p.get(0);
         }
     }
@@ -1320,6 +1423,8 @@ public final class VkDevice implements GfxDevice {
             LongBuffer p = stack.mallocLong(1);
             check(vkCreateImageView(device, ci, null, p), "vkCreateImageView(attachment)");
             viewCache.put(key, p.get(0));
+            viewOwners.attach(Long.valueOf(key), p.get(0),
+                    java.util.Collections.singletonList(Long.valueOf(img.handle)));
             return p.get(0);
         }
     }
@@ -1704,6 +1809,11 @@ public final class VkDevice implements GfxDevice {
             if (closed) return;
             closed = true;
             device.liveImages.remove(this);
+            // Order matters: the cached attachment views and the framebuffers
+            // that reference them go first, while this image is still a valid
+            // object to talk about, so nothing between these lines can draw
+            // through a view of a freed image.
+            device.purgeCachesForImage(handle);
             vkDestroyImageView(device.device, fullView, null);
             vkDestroyImage(device.device, handle, null);
             vkFreeMemory(device.device, memory, null);

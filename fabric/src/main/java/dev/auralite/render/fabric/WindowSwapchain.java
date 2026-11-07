@@ -45,6 +45,7 @@ public final class WindowSwapchain {
     private int previewW;      // preview texture extent (storage exists at this size)
     private int previewH;
     private byte[] stored;     // VK lane: this frame's readImage bytes, bottom row first
+    private byte[] lastPixels; // the bytes the LAST present uploaded (receipt source)
     private boolean everFilled;// VK lane: at least one readback has been uploaded
     private ByteBuffer uploadScratch; // persistent direct staging for the upload
 
@@ -152,6 +153,7 @@ public final class WindowSwapchain {
             GL11.glTexSubImage2D(GL11.GL_TEXTURE_2D, 0, 0, 0, width, height,
                     GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, uploadScratch);
             everFilled = true;
+            lastPixels = stored;
         }
         stored = null;
         return previewTex;
@@ -164,6 +166,14 @@ public final class WindowSwapchain {
     public boolean everFilled() {
         return device instanceof GlDevice || everFilled;
     }
+
+    /**
+     * The exact bytes the most recent present uploaded, or null. A receipt
+     * hashed from this is a receipt of what went to the window, not of what
+     * the CPU hoped the GPU had - which is the difference between a claim and
+     * a measurement (standing rule 4).
+     */
+    public byte[] lastPresentPixels() { return lastPixels; }
 
     /** Release the graph's image; must run on the device's context. */
     public void destroy() {

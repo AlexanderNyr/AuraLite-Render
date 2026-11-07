@@ -596,6 +596,14 @@ public final class GlDevice implements GfxDevice {
             GlImage img = ownImage(pass.depth.image);
             int point = img.desc.format.isStencil() ? GL_DEPTH_STENCIL_ATTACHMENT : GL_DEPTH_ATTACHMENT;
             attach(fbo, point, img, pass.depth);
+            // The clear is the only half that can be checked cheaply: a DONT_CARE
+            // depth attachment hands whatever the previous pass left in the image
+            // to this pass's depth test, and on GL the test then silently rejects
+            // everything a fullscreen triangle would write (gl_Position.z = 0
+            // against a mesh's 0.5). Making the attachment CLEAR is the SAME
+            // semantics the pack manifest asks for and the one Vulkan already
+            // gives - a depth buffer that starts each pass at its own value.
+            pass.depth.loadOp = dev.auralite.render.rhi.GfxEnums.LoadOp.CLEAR;
         }
         int status = glCheckNamedFramebufferStatus(fbo, GL_DRAW_FRAMEBUFFER);
         if (status != GL_FRAMEBUFFER_COMPLETE) {
@@ -927,6 +935,8 @@ public final class GlDevice implements GfxDevice {
         final GfxStage stage;
         final String entry;
         final String origin;
+        /** The source text, kept so sampler declarations can be read back. */
+        private final String sourceText;
         final long hash;
         final int name;
         final boolean valid;
@@ -962,11 +972,40 @@ public final class GlDevice implements GfxDevice {
             return out.toString();
         }
 
+        /**
+         * Points every sampler a linked program declares at the texture unit its
+         * descriptor write binds.
+         *
+         * <p>The declarations are read back out of the shader text: the OpenGL
+         * backend has no reflection over descriptor bindings, and the packing rule
+         * ({@code set * SET_STRIDE + binding}) is exactly the one
+         * {@link #packDescriptorSets} applies to the layout qualifier, so the
+         * number a stage samples from is the number the command buffer binds.
+         */
+        static void assignSamplerUnits(int program, GlShaderModule module) {
+            String src = module == null ? null : module.sourceText;
+            if (src == null || src.isEmpty()) return;
+            java.util.regex.Matcher m = java.util.regex.Pattern.compile(
+                    "layout\\s*\\(\\s*set\\s*=\\s*(\\d+)\\s*,\\s*binding\\s*=\\s*(\\d+)"
+                    + "\\s*\\)\\s*uniform\\s+(?:[a-z]+\\s+)?(?:[ui]?sampler|texture)\\w*"
+                    + "\\s+(\\w+)").matcher(src);
+            while (m.find()) {
+                int unit = Integer.parseInt(m.group(1)) * GlCommandBuffer.SET_STRIDE
+                        + Integer.parseInt(m.group(2));
+                int loc = org.lwjgl.opengl.GL46C.glGetUniformLocation(program, m.group(3));
+                if (loc >= 0) {
+                    org.lwjgl.opengl.GL46C.glProgramUniform1i(program, loc, unit);
+                }
+            }
+        }
+
         GlShaderModule(GlDevice device, ShaderSource source) {
             this.device = device;
             this.stage = source.stage();
             this.entry = source.entryPoint();
             this.origin = source.origin();
+            this.sourceText = source.kind() == ShaderSource.Kind.SPIRV ? ""
+                    : source.preprocessed();
             this.hash = source.hash();
             this.name = glCreateShader(GlEnumMap.shaderType(stage));
             if (source.kind() == ShaderSource.Kind.SPIRV) {
@@ -1056,6 +1095,15 @@ public final class GlDevice implements GfxDevice {
                 org.lwjgl.opengl.GL46C.glAttachShader(program, (int) s.handle());
             }
             glLinkProgram(program);
+            // GLSL samples from a UNIT, not from a binding: a sampler uniform no
+            // glUniform1i ever touched keeps unit 0. The backend binds sampled
+            // images at `set * SET_STRIDE + binding`, so a present stage that
+            // sampled binding 0 worked by coincidence of that arithmetic, and a
+            // stage sampling anything else read whatever sat on unit 0. Point
+            // each sampler at the unit its own descriptor write uses.
+            for (GfxShaderModule s : desc.stages) {
+                GlShaderModule.assignSamplerUnits(program, (GlShaderModule) s);
+            }
             this.valid = glGetProgrami(program, org.lwjgl.opengl.GL46C.GL_LINK_STATUS)
                     == org.lwjgl.opengl.GL46C.GL_TRUE;
             this.infoLog = valid ? "" : glGetProgramInfoLog(program).trim();
@@ -1076,6 +1124,7 @@ public final class GlDevice implements GfxDevice {
             this.program = glCreateProgram();
             org.lwjgl.opengl.GL46C.glAttachShader(program, (int) desc.stage.handle());
             glLinkProgram(program);
+            GlShaderModule.assignSamplerUnits(program, (GlShaderModule) desc.stage);
             this.valid = glGetProgrami(program, org.lwjgl.opengl.GL46C.GL_LINK_STATUS)
                     == org.lwjgl.opengl.GL46C.GL_TRUE;
             this.infoLog = valid ? "" : glGetProgramInfoLog(program).trim();

@@ -625,7 +625,17 @@ public final class GlCommandBuffer implements GfxCommandBuffer {
                 boolean layered = img.desc.arrayLayers > 1
                         || img.desc.type == dev.auralite.render.rhi.GfxEnums.ImageType.TEXTURE_3D
                         || img.desc.type == dev.auralite.render.rhi.GfxEnums.ImageType.CUBE;
-                glBindImageTexture(unit, (int) img.handle(), 0, layered, 0, GL_READ_WRITE, 0);
+                // The format argument is part of the contract, not a formality:
+                // it must be compatible with BOTH the texture's format and the
+                // shader's image declaration. Zero (the old argument) only says
+                // "whatever the texture already is", which GL accepts for a
+                // 32-bit integer image -- and then refuses at draw time with
+                // FORMAT_COMPATIBILITY for an r32ui/rg32ui declaration, which
+                // reads as "the shader sees nothing" rather than as an error.
+                // Naming the texture's own internal format keeps the two sides
+                // in agreement by construction.
+                glBindImageTexture(unit, (int) img.handle(), 0, layered, 0,
+                        GL_READ_WRITE, GlFormatTable.of(img.desc.format).internalFormat);
                 break;
             }
             default:
